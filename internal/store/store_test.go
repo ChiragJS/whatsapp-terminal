@@ -201,6 +201,132 @@ func TestStoreHandlesConcurrentReadsAndWrites(t *testing.T) {
 	}
 }
 
+func TestListChatsExcludesStatusBroadcast(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	if err := repo.UpsertChat(ctx, domain.ChatSummary{
+		JID:                "status@broadcast",
+		Title:              "status",
+		LastMessagePreview: "ignore me",
+		LastMessageAt:      time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("UpsertChat(status) error = %v", err)
+	}
+	if err := repo.UpsertChat(ctx, domain.ChatSummary{
+		JID:                "alice@s.whatsapp.net",
+		Title:              "Alice",
+		LastMessagePreview: "hello",
+		LastMessageAt:      time.Date(2026, 4, 5, 10, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("UpsertChat(alice) error = %v", err)
+	}
+
+	chats, err := repo.ListChats(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 1 {
+		t.Fatalf("len(chats) = %d, want 1", len(chats))
+	}
+	if chats[0].JID != "alice@s.whatsapp.net" {
+		t.Fatalf("chats[0].JID = %q, want alice@s.whatsapp.net", chats[0].JID)
+	}
+}
+
+func TestGetChatReturnsStoredLastMessageMetadataWithoutCachedMessages(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	ts := time.Date(2026, 4, 5, 15, 30, 0, 0, time.UTC)
+	if err := repo.UpsertChat(ctx, domain.ChatSummary{
+		JID:                "devesh@s.whatsapp.net",
+		Title:              "Devesh 306",
+		LastMessageID:      "last-msg-1",
+		LastMessagePreview: "Hey",
+		LastSenderName:     "Devesh 306",
+		LastMessageAt:      ts,
+	}); err != nil {
+		t.Fatalf("UpsertChat() error = %v", err)
+	}
+
+	chat, err := repo.GetChat(ctx, "devesh@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat == nil {
+		t.Fatal("GetChat() = nil, want chat summary")
+	}
+	if chat.LastMessageID != "last-msg-1" {
+		t.Fatalf("LastMessageID = %q, want last-msg-1", chat.LastMessageID)
+	}
+	if !chat.LastMessageAt.Equal(ts) {
+		t.Fatalf("LastMessageAt = %v, want %v", chat.LastMessageAt, ts)
+	}
+}
+
+func TestMergeChatJIDsCombinesSplitDirectThread(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:         "incoming-1",
+		ChatJID:    "919380050171@s.whatsapp.net",
+		SenderJID:  "919380050171@s.whatsapp.net",
+		SenderName: "Khushal",
+		Text:       "reply",
+		Timestamp:  time.Date(2026, 4, 5, 9, 58, 25, 0, time.UTC),
+		Receipt:    domain.ReceiptStateReceived,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage(incoming) error = %v", err)
+	}
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:         "outgoing-1",
+		ChatJID:    "51861780467888@lid",
+		SenderJID:  "self@s.whatsapp.net",
+		SenderName: "You",
+		Text:       "Yes",
+		Timestamp:  time.Date(2026, 4, 5, 9, 58, 48, 0, time.UTC),
+		FromMe:     true,
+		Receipt:    domain.ReceiptStateDelivered,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage(outgoing) error = %v", err)
+	}
+
+	if err := repo.MergeChatJIDs(ctx, "51861780467888@lid", "919380050171@s.whatsapp.net"); err != nil {
+		t.Fatalf("MergeChatJIDs() error = %v", err)
+	}
+
+	messages, err := repo.ListMessages(ctx, "919380050171@s.whatsapp.net", 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+	if messages[0].ID != "incoming-1" || messages[1].ID != "outgoing-1" {
+		t.Fatalf("messages = %#v, want merged incoming/outgoing thread", messages)
+	}
+}
+
 func TestListChatsIncludesMatchingContactsWithoutChatHistory(t *testing.T) {
 	t.Parallel()
 
@@ -320,5 +446,234 @@ func TestListMessagesPrefersContactNameOverStoredSenderNumber(t *testing.T) {
 	}
 	if messages[0].SenderName != "Aman Verma" {
 		t.Fatalf("messages[0].SenderName = %q, want Aman Verma", messages[0].SenderName)
+	}
+}
+
+func TestListChatsUsesLatestStoredMessageMetadata(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "chat-1@s.whatsapp.net"
+	if err := repo.UpsertContact(ctx, domain.Contact{
+		JID:         "friend@s.whatsapp.net",
+		DisplayName: "Friend",
+	}); err != nil {
+		t.Fatalf("UpsertContact(friend) error = %v", err)
+	}
+	if err := repo.UpsertChat(ctx, domain.ChatSummary{
+		JID:                chatJID,
+		Title:              "Friend",
+		LastMessageID:      "old-preview",
+		LastMessagePreview: "older cached preview",
+		LastSenderName:     "Friend",
+		LastMessageAt:      time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("UpsertChat() error = %v", err)
+	}
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:         "new-message",
+		ChatJID:    chatJID,
+		SenderJID:  "self@s.whatsapp.net",
+		SenderName: "You",
+		Text:       "latest body",
+		Timestamp:  time.Date(2026, 4, 5, 11, 0, 0, 0, time.UTC),
+		FromMe:     true,
+		Receipt:    domain.ReceiptStateRead,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+
+	chats, err := repo.ListChats(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 1 {
+		t.Fatalf("len(chats) = %d, want 1", len(chats))
+	}
+	if chats[0].LastMessagePreview != "latest body" {
+		t.Fatalf("LastMessagePreview = %q, want latest body", chats[0].LastMessagePreview)
+	}
+	if chats[0].LastSenderName != "You" {
+		t.Fatalf("LastSenderName = %q, want You", chats[0].LastSenderName)
+	}
+	if !chats[0].LastMessageAt.Equal(time.Date(2026, 4, 5, 11, 0, 0, 0, time.UTC)) {
+		t.Fatalf("LastMessageAt = %s", chats[0].LastMessageAt)
+	}
+}
+
+func TestListMessagesStableOrderForEqualTimestamp(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "project-alpha@g.us"
+	ts := time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC)
+	for _, msg := range []domain.Message{
+		{
+			ID:         "m1",
+			ChatJID:    chatJID,
+			SenderJID:  "self@s.whatsapp.net",
+			SenderName: "You",
+			Text:       "first at same second",
+			Timestamp:  ts,
+			FromMe:     true,
+			Receipt:    domain.ReceiptStateSent,
+			IsGroup:    true,
+		},
+		{
+			ID:         "m2",
+			ChatJID:    chatJID,
+			SenderJID:  "friend@s.whatsapp.net",
+			SenderName: "Friend",
+			Text:       "second at same second",
+			Timestamp:  ts,
+			Receipt:    domain.ReceiptStateReceived,
+			IsGroup:    true,
+		},
+	} {
+		if err := repo.RecordMessage(ctx, msg, false); err != nil {
+			t.Fatalf("RecordMessage(%s) error = %v", msg.ID, err)
+		}
+	}
+
+	messages, err := repo.ListMessages(ctx, chatJID, 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+	if messages[0].ID != "m1" || messages[1].ID != "m2" {
+		t.Fatalf("message order = [%s %s], want [m1 m2]", messages[0].ID, messages[1].ID)
+	}
+}
+
+func TestListChatsPrefersLatestInsertedMessageForEqualTimestamp(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "equal-ts@s.whatsapp.net"
+	ts := time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC)
+	for _, msg := range []domain.Message{
+		{
+			ID:         "m1",
+			ChatJID:    chatJID,
+			SenderJID:  "friend@s.whatsapp.net",
+			SenderName: "Friend",
+			Text:       "older render at same second",
+			Timestamp:  ts,
+			Receipt:    domain.ReceiptStateReceived,
+		},
+		{
+			ID:         "m2",
+			ChatJID:    chatJID,
+			SenderJID:  "self@s.whatsapp.net",
+			SenderName: "You",
+			Text:       "latest render at same second",
+			Timestamp:  ts,
+			FromMe:     true,
+			Receipt:    domain.ReceiptStateSent,
+		},
+	} {
+		if err := repo.RecordMessage(ctx, msg, false); err != nil {
+			t.Fatalf("RecordMessage(%s) error = %v", msg.ID, err)
+		}
+	}
+
+	chats, err := repo.ListChats(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 1 {
+		t.Fatalf("len(chats) = %d, want 1", len(chats))
+	}
+	if chats[0].LastMessageID != "m2" {
+		t.Fatalf("LastMessageID = %q, want m2", chats[0].LastMessageID)
+	}
+	if chats[0].LastMessagePreview != "latest render at same second" {
+		t.Fatalf("LastMessagePreview = %q", chats[0].LastMessagePreview)
+	}
+	if chats[0].LastSenderName != "You" {
+		t.Fatalf("LastSenderName = %q, want You", chats[0].LastSenderName)
+	}
+}
+
+func TestMessageMediaMetadataRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	msg := domain.Message{
+		ID:                 "media-1",
+		ChatJID:            "voice@s.whatsapp.net",
+		SenderJID:          "friend@s.whatsapp.net",
+		SenderName:         "Friend",
+		Text:               "[voice note]",
+		Timestamp:          time.Date(2026, 4, 5, 12, 0, 0, 0, time.UTC),
+		Receipt:            domain.ReceiptStateReceived,
+		MediaKind:          domain.MediaKindVoice,
+		MediaMIME:          "audio/ogg; codecs=opus",
+		MediaFileName:      "voice.ogg",
+		MediaDirectPath:    "/mms/audio/demo",
+		MediaFileLength:    12345,
+		MediaSeconds:       8,
+		MediaKey:           []byte{1, 2, 3},
+		MediaFileSHA256:    []byte{4, 5, 6},
+		MediaFileEncSHA256: []byte{7, 8, 9},
+	}
+	if err := repo.RecordMessage(ctx, msg, false); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+	if err := repo.MarkMessageDownloaded(ctx, msg.ChatJID, msg.ID, "/tmp/voice.ogg"); err != nil {
+		t.Fatalf("MarkMessageDownloaded() error = %v", err)
+	}
+
+	messages, err := repo.ListMessages(ctx, msg.ChatJID, 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("len(messages) = %d, want 1", len(messages))
+	}
+	got := messages[0]
+	if got.MediaKind != domain.MediaKindVoice {
+		t.Fatalf("MediaKind = %q, want %q", got.MediaKind, domain.MediaKindVoice)
+	}
+	if got.MediaDirectPath != "/mms/audio/demo" {
+		t.Fatalf("MediaDirectPath = %q", got.MediaDirectPath)
+	}
+	if got.MediaFileName != "voice.ogg" {
+		t.Fatalf("MediaFileName = %q", got.MediaFileName)
+	}
+	if got.MediaFileLength != 12345 {
+		t.Fatalf("MediaFileLength = %d", got.MediaFileLength)
+	}
+	if got.MediaSeconds != 8 {
+		t.Fatalf("MediaSeconds = %d", got.MediaSeconds)
+	}
+	if got.DownloadedPath != "/tmp/voice.ogg" {
+		t.Fatalf("DownloadedPath = %q", got.DownloadedPath)
 	}
 }

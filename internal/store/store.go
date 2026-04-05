@@ -16,6 +16,68 @@ type Store struct {
 	db *sql.DB
 }
 
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+const chatSummarySelect = `
+SELECT
+    chats.jid,
+    CASE
+        WHEN chats.is_group = 0 AND contacts.display_name <> '' THEN contacts.display_name
+        WHEN chats.is_group = 0 AND contacts.push_name <> '' THEN contacts.push_name
+        WHEN chats.is_group = 0 AND contacts.business_name <> '' THEN contacts.business_name
+        WHEN chats.title <> '' THEN chats.title
+        WHEN contacts.display_name <> '' THEN contacts.display_name
+        WHEN contacts.push_name <> '' THEN contacts.push_name
+        WHEN contacts.business_name <> '' THEN contacts.business_name
+        ELSE chats.jid
+    END AS title,
+    COALESCE((
+        SELECT id FROM messages
+        WHERE chat_jid = chats.jid
+        ORDER BY ts DESC, rowid DESC
+        LIMIT 1
+    ), chats.last_message_id) AS last_message_id,
+    COALESCE((
+        SELECT text_body FROM messages
+        WHERE chat_jid = chats.jid
+        ORDER BY ts DESC, rowid DESC
+        LIMIT 1
+    ), chats.last_message_preview) AS last_message_preview,
+    COALESCE((
+        SELECT CASE
+            WHEN messages.from_me = 1 THEN 'You'
+            WHEN message_contacts.display_name <> '' THEN message_contacts.display_name
+            WHEN message_contacts.push_name <> '' THEN message_contacts.push_name
+            WHEN message_contacts.business_name <> '' THEN message_contacts.business_name
+            WHEN messages.sender_name <> '' THEN messages.sender_name
+            ELSE messages.sender_jid
+        END
+        FROM messages
+        LEFT JOIN contacts AS message_contacts ON message_contacts.jid = messages.sender_jid
+        WHERE messages.chat_jid = chats.jid
+        ORDER BY messages.ts DESC, messages.rowid DESC
+        LIMIT 1
+    ), chats.last_sender_name) AS last_sender_name,
+    COALESCE((
+        SELECT ts FROM messages
+        WHERE chat_jid = chats.jid
+        ORDER BY ts DESC, rowid DESC
+        LIMIT 1
+    ), chats.last_message_at) AS last_message_at,
+    chats.unread_count,
+    chats.is_group
+FROM chats
+LEFT JOIN contacts ON contacts.jid = chats.jid
+`
+
+const messageSelectColumns = `
+id, chat_jid, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group,
+media_kind, media_mime, media_file_name, media_direct_path, media_file_length, media_seconds,
+media_key, media_file_sha256, media_file_enc_sha256, downloaded_path
+`
+
 func New(path string) (*Store, error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", path)
 	db, err := sql.Open("sqlite", dsn)
@@ -68,6 +130,16 @@ CREATE TABLE IF NOT EXISTS messages (
     from_me INTEGER NOT NULL DEFAULT 0,
     receipt TEXT NOT NULL DEFAULT 'unknown',
     is_group INTEGER NOT NULL DEFAULT 0,
+    media_kind TEXT NOT NULL DEFAULT '',
+    media_mime TEXT NOT NULL DEFAULT '',
+    media_file_name TEXT NOT NULL DEFAULT '',
+    media_direct_path TEXT NOT NULL DEFAULT '',
+    media_file_length INTEGER NOT NULL DEFAULT 0,
+    media_seconds INTEGER NOT NULL DEFAULT 0,
+    media_key BLOB,
+    media_file_sha256 BLOB,
+    media_file_enc_sha256 BLOB,
+    downloaded_path TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (chat_jid, id)
 );
 
@@ -78,6 +150,66 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
 		return fmt.Errorf("init schema: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_mime", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_file_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_direct_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_file_length", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_seconds", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_key", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_file_sha256", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "media_file_enc_sha256", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "messages", "downloaded_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
+		return fmt.Errorf("add %s.%s column: %w", table, column, err)
 	}
 	return nil
 }
@@ -129,6 +261,9 @@ SELECT display_name, push_name, business_name FROM contacts WHERE jid = ?
 }
 
 func (s *Store) UpsertChat(ctx context.Context, chat domain.ChatSummary) error {
+	if ignoredChatJID(chat.JID) {
+		return nil
+	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO chats (jid, title, normalized_title, is_group, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -161,44 +296,24 @@ ON CONFLICT(jid) DO UPDATE SET
 }
 
 func (s *Store) GetChat(ctx context.Context, jid string) (*domain.ChatSummary, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT
-    chats.jid,
-    CASE
-        WHEN chats.is_group = 0 AND contacts.display_name <> '' THEN contacts.display_name
-        WHEN chats.is_group = 0 AND contacts.push_name <> '' THEN contacts.push_name
-        WHEN chats.is_group = 0 AND contacts.business_name <> '' THEN contacts.business_name
-        WHEN chats.title <> '' THEN chats.title
-        WHEN contacts.display_name <> '' THEN contacts.display_name
-        WHEN contacts.push_name <> '' THEN contacts.push_name
-        WHEN contacts.business_name <> '' THEN contacts.business_name
-        ELSE chats.jid
-    END AS title,
-    chats.last_message_id,
-    chats.last_message_preview,
-    chats.last_sender_name,
-    chats.last_message_at,
-    chats.unread_count,
-    chats.is_group
-FROM chats
-LEFT JOIN contacts ON contacts.jid = chats.jid
-WHERE chats.jid = ?
-`, jid)
-	var chat domain.ChatSummary
-	var lastMessageAt string
-	var isGroup int
-	if err := row.Scan(&chat.JID, &chat.Title, &chat.LastMessageID, &chat.LastMessagePreview, &chat.LastSenderName, &lastMessageAt, &chat.UnreadCount, &isGroup); err != nil {
+	if ignoredChatJID(jid) {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, chatSummarySelect+`WHERE chats.jid = ?`, jid)
+	chat, err := scanChatSummary(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get chat %s: %w", jid, err)
 	}
-	chat.IsGroup = isGroup == 1
-	chat.LastMessageAt = parseTime(lastMessageAt)
 	return &chat, nil
 }
 
 func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, incrementUnread bool) error {
+	if ignoredChatJID(msg.ChatJID) {
+		return nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin message tx: %w", err)
@@ -210,9 +325,15 @@ func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, increment
 	}()
 
 	result, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO messages (chat_jid, id, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, msg.ChatJID, msg.ID, msg.SenderJID, msg.SenderName, msg.Text, timeString(msg.Timestamp), boolToInt(msg.FromMe), string(msg.Receipt), boolToInt(msg.IsGroup))
+	INSERT OR IGNORE INTO messages (
+	    chat_jid, id, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group,
+	    media_kind, media_mime, media_file_name, media_direct_path, media_file_length, media_seconds,
+	    media_key, media_file_sha256, media_file_enc_sha256, downloaded_path
+	)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, msg.ChatJID, msg.ID, msg.SenderJID, msg.SenderName, msg.Text, timeString(msg.Timestamp), boolToInt(msg.FromMe), string(msg.Receipt), boolToInt(msg.IsGroup),
+		string(msg.MediaKind), msg.MediaMIME, msg.MediaFileName, msg.MediaDirectPath, int64(msg.MediaFileLength), int64(msg.MediaSeconds),
+		msg.MediaKey, msg.MediaFileSHA256, msg.MediaFileEncSHA256, msg.DownloadedPath)
 	if err != nil {
 		return fmt.Errorf("insert message %s: %w", msg.ID, err)
 	}
@@ -307,31 +428,88 @@ UPDATE chats SET unread_count = 0 WHERE jid = ?
 	return nil
 }
 
+func (s *Store) MergeChatJIDs(ctx context.Context, fromJID, toJID string) error {
+	if fromJID == "" || toJID == "" || fromJID == toJID {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin merge chat tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var chat domain.ChatSummary
+	var lastMessageAt string
+	var isGroup int
+	row := tx.QueryRowContext(ctx, `
+SELECT jid, title, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count, is_group
+FROM chats WHERE jid = ?
+`, fromJID)
+	switch scanErr := row.Scan(&chat.JID, &chat.Title, &chat.LastMessageID, &chat.LastMessagePreview, &chat.LastSenderName, &lastMessageAt, &chat.UnreadCount, &isGroup); scanErr {
+	case nil:
+		chat.LastMessageAt = parseTime(lastMessageAt)
+		chat.IsGroup = isGroup == 1
+	case sql.ErrNoRows:
+		chat.JID = toJID
+	default:
+		return fmt.Errorf("load chat %s for merge: %w", fromJID, scanErr)
+	}
+
+	if _, err = tx.ExecContext(ctx, `UPDATE messages SET chat_jid = ? WHERE chat_jid = ?`, toJID, fromJID); err != nil {
+		return fmt.Errorf("move messages from %s to %s: %w", fromJID, toJID, err)
+	}
+
+	if chat.Title != "" || chat.LastMessageID != "" || chat.UnreadCount > 0 {
+		chat.JID = toJID
+		if _, err = tx.ExecContext(ctx, `
+INSERT INTO chats (jid, title, normalized_title, is_group, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(jid) DO UPDATE SET
+	title = CASE WHEN chats.title = '' THEN excluded.title ELSE chats.title END,
+	normalized_title = CASE WHEN chats.normalized_title = '' THEN excluded.normalized_title ELSE chats.normalized_title END,
+	is_group = CASE WHEN excluded.is_group = 1 THEN 1 ELSE chats.is_group END,
+	unread_count = chats.unread_count + excluded.unread_count,
+	last_message_id = CASE
+		WHEN excluded.last_message_at > chats.last_message_at THEN excluded.last_message_id
+		ELSE chats.last_message_id
+	END,
+	last_message_preview = CASE
+		WHEN excluded.last_message_at > chats.last_message_at THEN excluded.last_message_preview
+		ELSE chats.last_message_preview
+	END,
+	last_sender_name = CASE
+		WHEN excluded.last_message_at > chats.last_message_at THEN excluded.last_sender_name
+		ELSE chats.last_sender_name
+	END,
+	last_message_at = CASE
+		WHEN excluded.last_message_at > chats.last_message_at THEN excluded.last_message_at
+		ELSE chats.last_message_at
+	END
+`, chat.JID, chat.Title, NormalizeSearch(strings.Join([]string{chat.Title, chat.JID}, " ")), boolToInt(chat.IsGroup), chat.LastMessageID, chat.LastMessagePreview, chat.LastSenderName, timeString(chat.LastMessageAt), chat.UnreadCount); err != nil {
+			return fmt.Errorf("upsert merged chat %s: %w", toJID, err)
+		}
+	}
+
+	if _, err = tx.ExecContext(ctx, `DELETE FROM chats WHERE jid = ?`, fromJID); err != nil {
+		return fmt.Errorf("delete merged chat %s: %w", fromJID, err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("commit merge chat tx: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ListChats(ctx context.Context, query string, limit int) ([]domain.ChatSummary, error) {
 	query = NormalizeSearch(query)
 	like := "%" + query + "%"
-	rows, err := s.db.QueryContext(ctx, `
-SELECT
-    chats.jid,
-    CASE
-        WHEN chats.is_group = 0 AND contacts.display_name <> '' THEN contacts.display_name
-        WHEN chats.is_group = 0 AND contacts.push_name <> '' THEN contacts.push_name
-        WHEN chats.is_group = 0 AND contacts.business_name <> '' THEN contacts.business_name
-        WHEN chats.title <> '' THEN chats.title
-        WHEN contacts.display_name <> '' THEN contacts.display_name
-        WHEN contacts.push_name <> '' THEN contacts.push_name
-        WHEN contacts.business_name <> '' THEN contacts.business_name
-        ELSE chats.jid
-    END AS title,
-    chats.last_message_id,
-    chats.last_message_preview,
-    chats.last_sender_name,
-    chats.last_message_at,
-    chats.unread_count,
-    chats.is_group
-FROM chats
-LEFT JOIN contacts ON contacts.jid = chats.jid
-WHERE ? = '' OR chats.normalized_title LIKE ? OR chats.jid LIKE ? OR contacts.normalized_name LIKE ?
+	rows, err := s.db.QueryContext(ctx, chatSummarySelect+`
+WHERE chats.jid <> 'status@broadcast' AND (? = '' OR chats.normalized_title LIKE ? OR chats.jid LIKE ? OR contacts.normalized_name LIKE ?)
 ORDER BY last_message_at DESC, title ASC
 LIMIT ?
 `, query, like, like, like, limit)
@@ -343,14 +521,10 @@ LIMIT ?
 	var chats []domain.ChatSummary
 	seen := make(map[string]struct{}, limit)
 	for rows.Next() {
-		var chat domain.ChatSummary
-		var lastMessageAt string
-		var isGroup int
-		if err := rows.Scan(&chat.JID, &chat.Title, &chat.LastMessageID, &chat.LastMessagePreview, &chat.LastSenderName, &lastMessageAt, &chat.UnreadCount, &isGroup); err != nil {
+		chat, err := scanChatSummary(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan chat: %w", err)
 		}
-		chat.IsGroup = isGroup == 1
-		chat.LastMessageAt = parseTime(lastMessageAt)
 		chats = append(chats, chat)
 		seen[chat.JID] = struct{}{}
 	}
@@ -416,16 +590,18 @@ SELECT id, chat_jid, sender_jid,
            WHEN sender_name <> '' THEN sender_name
            ELSE sender_jid
        END AS sender_name,
-       text_body, ts, from_me, receipt, is_group
+       text_body, ts, from_me, receipt, is_group,
+       media_kind, media_mime, media_file_name, media_direct_path, media_file_length, media_seconds,
+       media_key, media_file_sha256, media_file_enc_sha256, downloaded_path
 FROM (
-    SELECT id, chat_jid, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group
+    SELECT rowid AS message_rowid, `+messageSelectColumns+`
     FROM messages
     WHERE chat_jid = ?
-    ORDER BY ts DESC
+    ORDER BY ts DESC, rowid DESC
     LIMIT ?
  ) recent_messages
 LEFT JOIN contacts ON contacts.jid = recent_messages.sender_jid
-ORDER BY ts ASC
+ORDER BY ts ASC, message_rowid ASC
 `, chatJID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list messages %s: %w", chatJID, err)
@@ -434,17 +610,10 @@ ORDER BY ts ASC
 
 	var messages []domain.Message
 	for rows.Next() {
-		var msg domain.Message
-		var ts string
-		var fromMe, isGroup int
-		var receipt string
-		if err := rows.Scan(&msg.ID, &msg.ChatJID, &msg.SenderJID, &msg.SenderName, &msg.Text, &ts, &fromMe, &receipt, &isGroup); err != nil {
+		msg, err := scanStoredMessage(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
-		msg.Timestamp = parseTime(ts)
-		msg.FromMe = fromMe == 1
-		msg.Receipt = domain.ReceiptState(receipt)
-		msg.IsGroup = isGroup == 1
 		messages = append(messages, msg)
 	}
 	return messages, rows.Err()
@@ -452,27 +621,32 @@ ORDER BY ts ASC
 
 func (s *Store) OldestMessage(ctx context.Context, chatJID string) (*domain.Message, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, chat_jid, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group
-FROM messages
+	SELECT `+messageSelectColumns+`
+	FROM messages
 WHERE chat_jid = ?
-ORDER BY ts ASC
+ORDER BY ts ASC, rowid ASC
 LIMIT 1
 `, chatJID)
-
-	var msg domain.Message
-	var ts, receipt string
-	var fromMe, isGroup int
-	if err := row.Scan(&msg.ID, &msg.ChatJID, &msg.SenderJID, &msg.SenderName, &msg.Text, &ts, &fromMe, &receipt, &isGroup); err != nil {
+	msg, err := scanStoredMessage(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("oldest message %s: %w", chatJID, err)
 	}
-	msg.Timestamp = parseTime(ts)
-	msg.FromMe = fromMe == 1
-	msg.Receipt = domain.ReceiptState(receipt)
-	msg.IsGroup = isGroup == 1
 	return &msg, nil
+}
+
+func (s *Store) MarkMessageDownloaded(ctx context.Context, chatJID, messageID, downloadedPath string) error {
+	_, err := s.db.ExecContext(ctx, `
+	UPDATE messages
+	SET downloaded_path = ?
+	WHERE chat_jid = ? AND id = ?
+	`, downloadedPath, chatJID, messageID)
+	if err != nil {
+		return fmt.Errorf("mark message downloaded %s/%s: %w", chatJID, messageID, err)
+	}
+	return nil
 }
 
 func boolToInt(value bool) int {
@@ -516,6 +690,10 @@ func previewText(text string) string {
 	return text[:maxLen-1] + "…"
 }
 
+func ignoredChatJID(jid string) bool {
+	return jid == "status@broadcast"
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -523,4 +701,45 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func maxInt64(value, floor int64) int64 {
+	if value < floor {
+		return floor
+	}
+	return value
+}
+
+func scanChatSummary(scanner rowScanner) (domain.ChatSummary, error) {
+	var chat domain.ChatSummary
+	var lastMessageAt string
+	var isGroup int
+	if err := scanner.Scan(&chat.JID, &chat.Title, &chat.LastMessageID, &chat.LastMessagePreview, &chat.LastSenderName, &lastMessageAt, &chat.UnreadCount, &isGroup); err != nil {
+		return domain.ChatSummary{}, err
+	}
+	chat.IsGroup = isGroup == 1
+	chat.LastMessageAt = parseTime(lastMessageAt)
+	return chat, nil
+}
+
+func scanStoredMessage(scanner rowScanner) (domain.Message, error) {
+	var msg domain.Message
+	var ts, receipt, mediaKind string
+	var fromMe, isGroup int
+	var mediaFileLength, mediaSeconds int64
+	if err := scanner.Scan(
+		&msg.ID, &msg.ChatJID, &msg.SenderJID, &msg.SenderName, &msg.Text, &ts, &fromMe, &receipt, &isGroup,
+		&mediaKind, &msg.MediaMIME, &msg.MediaFileName, &msg.MediaDirectPath, &mediaFileLength, &mediaSeconds,
+		&msg.MediaKey, &msg.MediaFileSHA256, &msg.MediaFileEncSHA256, &msg.DownloadedPath,
+	); err != nil {
+		return domain.Message{}, err
+	}
+	msg.Timestamp = parseTime(ts)
+	msg.FromMe = fromMe == 1
+	msg.Receipt = domain.ReceiptState(receipt)
+	msg.IsGroup = isGroup == 1
+	msg.MediaKind = domain.MediaKind(mediaKind)
+	msg.MediaFileLength = uint64(maxInt64(mediaFileLength, 0))
+	msg.MediaSeconds = uint32(maxInt64(mediaSeconds, 0))
+	return msg, nil
 }

@@ -39,11 +39,12 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	defer transport.Stop()
 
-	model := ui.NewModelWithOptions(repo, transport, nil, cfg.NoAltScreen)
+	model := ui.NewModelWithRuntimeOptions(repo, transport, nil, nil, nil, filepath.Join(cfg.DataDir, "downloads"), cfg.NoAltScreen)
 	options := []tea.ProgramOption{}
 	if !cfg.NoAltScreen {
 		options = append(options, tea.WithAltScreen())
 	}
+	options = append(options, tea.WithMouseCellMotion())
 	program := tea.NewProgram(model, options...)
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run TUI: %w", err)

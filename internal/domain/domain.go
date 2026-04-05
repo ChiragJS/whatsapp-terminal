@@ -15,6 +15,18 @@ const (
 	ReceiptStateReceived  ReceiptState = "received"
 )
 
+type MediaKind string
+
+const (
+	MediaKindNone     MediaKind = ""
+	MediaKindImage    MediaKind = "image"
+	MediaKindVideo    MediaKind = "video"
+	MediaKindAudio    MediaKind = "audio"
+	MediaKindVoice    MediaKind = "voice"
+	MediaKindDocument MediaKind = "document"
+	MediaKindSticker  MediaKind = "sticker"
+)
+
 type EventType string
 
 const (
@@ -44,15 +56,25 @@ type ChatSummary struct {
 }
 
 type Message struct {
-	ID         string
-	ChatJID    string
-	SenderJID  string
-	SenderName string
-	Text       string
-	Timestamp  time.Time
-	FromMe     bool
-	Receipt    ReceiptState
-	IsGroup    bool
+	ID                 string
+	ChatJID            string
+	SenderJID          string
+	SenderName         string
+	Text               string
+	Timestamp          time.Time
+	FromMe             bool
+	Receipt            ReceiptState
+	IsGroup            bool
+	MediaKind          MediaKind
+	MediaMIME          string
+	MediaFileName      string
+	MediaDirectPath    string
+	MediaFileLength    uint64
+	MediaSeconds       uint32
+	MediaKey           []byte
+	MediaFileSHA256    []byte
+	MediaFileEncSHA256 []byte
+	DownloadedPath     string
 }
 
 type Event struct {
@@ -61,6 +83,7 @@ type Event struct {
 	Status  string
 	QRCode  string
 	Err     error
+	Notify  bool
 }
 
 type Transport interface {
@@ -69,5 +92,8 @@ type Transport interface {
 	Events() <-chan Event
 	SendText(context.Context, string, string) error
 	SendImage(context.Context, string, string, string) error
+	SendMedia(context.Context, string, string, string) error
+	SendVoiceNote(context.Context, string, string, time.Duration) error
+	DownloadMedia(context.Context, Message, string) (string, error)
 	RequestHistory(context.Context, string, int) error
 }

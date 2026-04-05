@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"mime"
+	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,24 +92,66 @@ func (t *Transport) SendText(ctx context.Context, chatJID, text string) error {
 }
 
 func (t *Transport) SendImage(ctx context.Context, chatJID, path, caption string) error {
+	return t.recordOutgoingMedia(ctx, chatJID, path, caption, domain.MediaKindImage, domain.MediaKindImage, 0)
+}
+
+func (t *Transport) SendMedia(ctx context.Context, chatJID, path, caption string) error {
+	kind, err := detectMediaKind(path)
+	if err != nil {
+		return err
+	}
+	return t.recordOutgoingMedia(ctx, chatJID, path, caption, kind, kind, 0)
+}
+
+func (t *Transport) SendVoiceNote(ctx context.Context, chatJID, path string, duration time.Duration) error {
+	return t.recordOutgoingMedia(ctx, chatJID, path, "", domain.MediaKindVoice, domain.MediaKindAudio, duration)
+}
+
+func (t *Transport) DownloadMedia(ctx context.Context, msg domain.Message, downloadDir string) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if msg.MediaKind == domain.MediaKindNone {
+		return "", fmt.Errorf("message does not contain downloadable media")
+	}
+	if err := os.MkdirAll(downloadDir, 0o700); err != nil {
+		return "", err
+	}
+	name := msg.MediaFileName
+	if name == "" {
+		name = fmt.Sprintf("%s%s", msg.ID, mediaExtension(msg.MediaMIME, msg.MediaKind))
+	}
+	targetPath := filepath.Join(downloadDir, name)
+	content := []byte("demo media placeholder")
+	if err := os.WriteFile(targetPath, content, 0o600); err != nil {
+		return "", err
+	}
+	if err := t.repo.MarkMessageDownloaded(ctx, msg.ChatJID, msg.ID, targetPath); err != nil {
+		return "", err
+	}
+	return targetPath, nil
+}
+
+func (t *Transport) recordOutgoingMedia(ctx context.Context, chatJID, path, caption string, previewKind, storedKind domain.MediaKind, duration time.Duration) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	now := time.Now().UTC()
-	preview := "[image] " + filepath.Base(path)
-	if caption != "" {
-		preview += " — " + caption
-	}
+	preview := mediaPreview(previewKind, path, caption)
 	msg := domain.Message{
-		ID:         fmt.Sprintf("demo-image-%d", now.UnixNano()),
-		ChatJID:    chatJID,
-		SenderJID:  "self@s.whatsapp.net",
-		SenderName: "You",
-		Text:       preview,
-		Timestamp:  now,
-		FromMe:     true,
-		Receipt:    domain.ReceiptStateSent,
-		IsGroup:    chatJID == "project-alpha@g.us",
+		ID:            fmt.Sprintf("demo-media-%d", now.UnixNano()),
+		ChatJID:       chatJID,
+		SenderJID:     "self@s.whatsapp.net",
+		SenderName:    "You",
+		Text:          preview,
+		Timestamp:     now,
+		FromMe:        true,
+		Receipt:       domain.ReceiptStateSent,
+		IsGroup:       chatJID == "project-alpha@g.us",
+		MediaKind:     storedKind,
+		MediaMIME:     detectMIME(path),
+		MediaFileName: filepath.Base(path),
+		MediaSeconds:  uint32(duration.Round(time.Second) / time.Second),
 	}
 	if err := t.repo.RecordMessage(ctx, msg, false); err != nil {
 		return err
@@ -127,9 +173,8 @@ func (t *Transport) SendImage(ctx context.Context, chatJID, path, caption string
 	}); err != nil {
 		return err
 	}
-
 	t.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID})
-	t.emit(domain.Event{Type: domain.EventStatus, Status: "Image sent in demo mode"})
+	t.emit(domain.Event{Type: domain.EventStatus, Status: fmt.Sprintf("%s sent in demo mode", mediaStatusLabel(previewKind))})
 	return nil
 }
 
@@ -165,6 +210,80 @@ func (t *Transport) RequestHistory(ctx context.Context, chatJID string, count in
 	t.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID})
 	t.emit(domain.Event{Type: domain.EventStatus, Status: "Loaded older demo history"})
 	return nil
+}
+
+func detectMediaKind(path string) (domain.MediaKind, error) {
+	mimeType := detectMIME(path)
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return domain.MediaKindImage, nil
+	case strings.HasPrefix(mimeType, "video/"):
+		return domain.MediaKindVideo, nil
+	case strings.HasPrefix(mimeType, "audio/"):
+		return domain.MediaKindAudio, nil
+	default:
+		return domain.MediaKindDocument, nil
+	}
+}
+
+func detectMIME(path string) string {
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	if mimeType != "" {
+		return mimeType
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	defer file.Close()
+	sample := make([]byte, 512)
+	n, _ := file.Read(sample)
+	return http.DetectContentType(sample[:n])
+}
+
+func mediaPreview(kind domain.MediaKind, path, caption string) string {
+	label := "[" + string(kind) + "]"
+	if kind == domain.MediaKindVoice {
+		label = "[voice note]"
+	}
+	preview := label + " " + filepath.Base(path)
+	if strings.TrimSpace(caption) != "" {
+		preview += " — " + strings.TrimSpace(caption)
+	}
+	return preview
+}
+
+func mediaExtension(mimeType string, kind domain.MediaKind) string {
+	if extensions, _ := mime.ExtensionsByType(mimeType); len(extensions) > 0 {
+		return extensions[0]
+	}
+	switch kind {
+	case domain.MediaKindImage:
+		return ".img"
+	case domain.MediaKindVideo:
+		return ".mp4"
+	case domain.MediaKindVoice:
+		return ".ogg"
+	case domain.MediaKindAudio:
+		return ".audio"
+	default:
+		return ".bin"
+	}
+}
+
+func mediaStatusLabel(kind domain.MediaKind) string {
+	switch kind {
+	case domain.MediaKindVoice:
+		return "Voice note"
+	case domain.MediaKindImage:
+		return "Image"
+	case domain.MediaKindVideo:
+		return "Video"
+	case domain.MediaKindAudio:
+		return "Audio"
+	default:
+		return "Media"
+	}
 }
 
 func (t *Transport) seed(ctx context.Context) error {
