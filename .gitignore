@@ -1,0 +1,18 @@
+# Binaries
+whatsapp-terminal
+dist/
+bin/
+
+# Local app state
+*.db
+*.db-shm
+*.db-wal
+debug.log
+tmp-demo/
+tmp-demo-*/
+*.log
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
