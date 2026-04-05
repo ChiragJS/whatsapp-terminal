@@ -1,5 +1,6 @@
 # Binaries
 whatsapp-terminal
+!cmd/whatsapp-terminal/
 dist/
 bin/
 

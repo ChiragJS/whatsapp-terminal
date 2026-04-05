@@ -14,6 +14,7 @@ type Config struct {
 	Debug       bool
 	Demo        bool
 	NoAltScreen bool
+	ShowVersion bool
 }
 
 func Parse() (Config, error) {
@@ -29,8 +30,12 @@ func Parse() (Config, error) {
 	flag.BoolVar(&cfg.Debug, "debug", false, "enable debug logging to a file under the data directory")
 	flag.BoolVar(&cfg.Demo, "demo", false, "run in offline demo mode with seeded data")
 	flag.BoolVar(&cfg.NoAltScreen, "no-alt-screen", false, "disable terminal alt-screen mode")
+	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version information and exit")
 	flag.Parse()
 
+	if cfg.ShowVersion {
+		return cfg, nil
+	}
 	if cfg.SessionName == "" {
 		return Config{}, fmt.Errorf("session-name cannot be empty")
 	}

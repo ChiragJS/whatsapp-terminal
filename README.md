@@ -51,6 +51,30 @@ Useful flags:
 - `--debug`: write structured debug logs to `debug.log`
 - `--demo`: launch with seeded offline data for TUI work
 - `--no-alt-screen`: render in the main terminal buffer instead of the alternate screen
+- `--version`: print the embedded release version and exit
+
+## Releases And Binaries
+
+Tagged releases publish cross-platform binaries to GitHub Releases through GoReleaser.
+
+- Linux: `amd64`, `arm64`
+- macOS: `amd64`, `arm64`
+- Windows: `amd64`, `arm64`
+
+Release flow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That tag triggers the release workflow, which builds archives, publishes a GitHub Release, and attaches `checksums.txt`.
+
+Users can download the right archive from the Releases page and run:
+
+```bash
+./whatsapp-terminal --version
+```
 
 ## Development
 
@@ -58,6 +82,7 @@ Useful flags:
 go test ./...
 go build ./...
 go vet ./...
+go run ./cmd/whatsapp-terminal --version
 ```
 
 The app uses pure-Go SQLite via `modernc.org/sqlite`, so local builds do not need CGO.

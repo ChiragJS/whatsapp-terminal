@@ -1,0 +1,66 @@
+version: 2
+
+project_name: whatsapp-terminal
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: whatsapp-terminal
+    main: ./cmd/whatsapp-terminal
+    binary: whatsapp-terminal
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/chirag/whatsapp-terminal/internal/version.Version={{.Version}}
+      - -X github.com/chirag/whatsapp-terminal/internal/version.Commit={{.Commit}}
+      - -X github.com/chirag/whatsapp-terminal/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    ids:
+      - whatsapp-terminal
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: ChiragJS
+    name: whatsapp-terminal
+  draft: false
+  prerelease: auto
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
