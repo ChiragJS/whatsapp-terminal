@@ -1,29 +1,88 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
-
-	sysclipboard "golang.design/x/clipboard"
+	"os/exec"
+	"runtime"
+	"strings"
 )
 
 type clipboardReader interface {
 	ReadImage() ([]byte, error)
 }
 
-type systemClipboard struct {
-	initErr error
-}
+type systemClipboard struct{}
 
 func newSystemClipboard() clipboardReader {
-	return &systemClipboard{initErr: sysclipboard.Init()}
+	return &systemClipboard{}
 }
 
 func (c *systemClipboard) ReadImage() ([]byte, error) {
-	if c.initErr != nil {
-		return nil, fmt.Errorf("clipboard image access unavailable: %w", c.initErr)
+	switch runtime.GOOS {
+	case "linux":
+		return readLinuxClipboardImage()
+	case "darwin":
+		return readMacClipboardImage()
+	case "windows":
+		return nil, fmt.Errorf("clipboard image access is not yet supported on Windows releases")
+	default:
+		return nil, fmt.Errorf("clipboard image access is not supported on %s", runtime.GOOS)
 	}
-	data := sysclipboard.Read(sysclipboard.FmtImage)
-	if len(data) == 0 {
+}
+
+func readLinuxClipboardImage() ([]byte, error) {
+	if data, err := readWaylandClipboardImage(); err == nil {
+		return data, nil
+	}
+	if data, err := readX11ClipboardImage(); err == nil {
+		return data, nil
+	}
+	return nil, fmt.Errorf("clipboard image access unavailable: install wl-clipboard for Wayland or xclip for X11")
+}
+
+func readWaylandClipboardImage() ([]byte, error) {
+	if _, err := exec.LookPath("wl-paste"); err != nil {
+		return nil, err
+	}
+	out, err := exec.Command("wl-paste", "--list-types").Output()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.Contains(string(out), "image/png") {
+		return nil, fmt.Errorf("clipboard does not currently contain a PNG image")
+	}
+	return readClipboardCommand("wl-paste", "--no-newline", "--type", "image/png")
+}
+
+func readX11ClipboardImage() ([]byte, error) {
+	if _, err := exec.LookPath("xclip"); err != nil {
+		return nil, err
+	}
+	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o").Output()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.Contains(string(out), "image/png") {
+		return nil, fmt.Errorf("clipboard does not currently contain a PNG image")
+	}
+	return readClipboardCommand("xclip", "-selection", "clipboard", "-t", "image/png", "-o")
+}
+
+func readMacClipboardImage() ([]byte, error) {
+	if _, err := exec.LookPath("pngpaste"); err != nil {
+		return nil, fmt.Errorf("clipboard image access unavailable: install pngpaste")
+	}
+	return readClipboardCommand("pngpaste", "-")
+}
+
+func readClipboardCommand(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	data, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, fmt.Errorf("clipboard does not currently contain an image")
 	}
 	return data, nil
