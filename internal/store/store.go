@@ -704,13 +704,6 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func maxInt64(value, floor int64) int64 {
-	if value < floor {
-		return floor
-	}
-	return value
-}
-
 func scanChatSummary(scanner rowScanner) (domain.ChatSummary, error) {
 	var chat domain.ChatSummary
 	var lastMessageAt string

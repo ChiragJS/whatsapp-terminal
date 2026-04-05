@@ -37,7 +37,11 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err := transport.Start(ctx); err != nil {
 		return err
 	}
-	defer transport.Stop()
+	defer func() {
+		if err := transport.Stop(); err != nil {
+			logger.Warn("stop transport", "error", err)
+		}
+	}()
 
 	model := ui.NewModelWithRuntimeOptions(repo, transport, nil, nil, nil, filepath.Join(cfg.DataDir, "downloads"), cfg.NoAltScreen)
 	options := []tea.ProgramOption{}

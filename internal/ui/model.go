@@ -632,7 +632,7 @@ func (m Model) renderChatList() string {
 func (m Model) renderThread() string {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader(m.threadTitle(), "")
-	help := "esc back  i compose  u load older messages  q quit"
+	var help string
 	if m.composing {
 		help = "enter send  esc cancel  + files  alt+v voice  ctrl+v paste image  u history  d download  q quit"
 	} else {
@@ -833,16 +833,6 @@ func sendStagedAttachmentsCmd(transport domain.Transport, chatJID string, attach
 	}
 }
 
-func bellCmd(sounder sounder) tea.Cmd {
-	return func() tea.Msg {
-		if sounder == nil {
-			return nil
-		}
-		_ = sounder.Bell()
-		return nil
-	}
-}
-
 func requestHistoryCmd(transport domain.Transport, chatJID string, count int) tea.Cmd {
 	return func() tea.Msg {
 		err := transport.RequestHistory(context.Background(), chatJID, count)
@@ -875,13 +865,6 @@ func clampSelection(selected, total int) int {
 		return total - 1
 	}
 	return selected
-}
-
-func visibleMessages(messages []domain.Message, limit int) []domain.Message {
-	if limit <= 0 || len(messages) <= limit {
-		return messages
-	}
-	return messages[len(messages)-limit:]
 }
 
 func suffix(input string) string {
@@ -918,13 +901,6 @@ func renderQRCode(code string) string {
 		lines[i] = strings.TrimRight(lines[i], " ")
 	}
 	return strings.Join(lines, "\n")
-}
-
-func renderError(err string) string {
-	if err == "" {
-		return ""
-	}
-	return errorStyle.Render(err)
 }
 
 func (m Model) renderHeader(title, subtitle string) string {
@@ -1320,17 +1296,6 @@ func (m *Model) applySelectedPathSuggestion() bool {
 	return true
 }
 
-func (m Model) composeSuggestionHeight(width int) int {
-	if len(m.pathSuggestions) == 0 {
-		return 0
-	}
-	lines := 1
-	for _, suggestion := range m.pathSuggestions {
-		lines += countRenderedLines(truncateText(suggestion.label, max(12, width)))
-	}
-	return lines
-}
-
 func (m Model) renderPathSuggestions(width int) string {
 	if len(m.pathSuggestions) == 0 {
 		return ""
@@ -1637,13 +1602,6 @@ func composeSuggestedPath(typed, lookupDir, entry string, isDir bool) string {
 	return suggestion
 }
 
-func formatSuggestedPath(path string, isDir bool) string {
-	if isDir && !strings.HasSuffix(path, string(os.PathSeparator)) {
-		return path + string(os.PathSeparator)
-	}
-	return path
-}
-
 func composeSuggestionValue(query pathSuggestionQuery, path string, isDir bool) string {
 	renderedPath := path
 	if query.quoted || strings.ContainsRune(path, ' ') {
@@ -1801,13 +1759,11 @@ func parseImageCommand(input string) (string, string, error) {
 
 var (
 	titleStyle               = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69"))
-	statusStyle              = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	mutedStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	errorStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
 	itemStyle                = lipgloss.NewStyle()
 	selectedItemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
 	metaStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-	senderStyle              = lipgloss.NewStyle().Bold(true)
 	bodyStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	toolbarButtonStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238")).Padding(0, 1)
 	toolbarActiveButtonStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("34")).Padding(0, 1)
@@ -1816,5 +1772,4 @@ var (
 	qrBoxStyle               = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62")).Padding(1, 2)
 	headerStyle              = lipgloss.NewStyle().Padding(0, 1)
 	footerStyle              = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
-	statusBadgeStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("34")).Padding(0, 1)
 )
