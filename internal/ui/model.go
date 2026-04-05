@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -124,7 +125,7 @@ type Model struct {
 	recordingSince time.Time
 
 	search    textinput.Model
-	composer  textinput.Model
+	composer  textarea.Model
 	clipboard clipboardReader
 	sounder   sounder
 	recorder  voiceRecorder
@@ -172,10 +173,13 @@ func NewModelWithRuntimeOptions(repo *appstore.Store, transport domain.Transport
 	search.Prompt = "Search: "
 	search.CharLimit = 128
 
-	composer := textinput.New()
+	composer := textarea.New()
 	composer.Placeholder = "Type a message (i)"
 	composer.Prompt = "> "
 	composer.CharLimit = 4096
+	composer.ShowLineNumbers = false
+	composer.SetHeight(3)
+	composer.SetWidth(48)
 
 	return Model{
 		repo:          repo,
@@ -448,8 +452,12 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.redrawCmd()
 					}
 				}
-			case "+", "ctrl+o":
+			case "ctrl+o":
 				m.openFilePicker()
+				return m, m.redrawCmd()
+			case "+":
+				m.composer.InsertRune('+')
+				m.refreshPathSuggestions()
 				return m, m.redrawCmd()
 			case "ctrl+n":
 				if len(m.pathSuggestions) > 0 {
@@ -481,6 +489,10 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.redrawCmd(), stageClipboardImageCmd(m.clipboard, m.nextImagePlaceholder()))
 			case "alt+v":
 				return m.toggleVoiceRecording()
+			case "shift+enter", "ctrl+j", "alt+enter":
+				m.insertComposerText("\n")
+				m.refreshPathSuggestions()
+				return m, m.redrawCmd()
 			case "enter":
 				if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
 					if m.applySelectedPathSuggestion() {
@@ -634,7 +646,7 @@ func (m Model) renderThread() string {
 	header := m.renderHeader(m.threadTitle(), "")
 	var help string
 	if m.composing {
-		help = "enter send  esc cancel  + files  alt+v voice  ctrl+v paste image  u history  d download  q quit"
+		help = "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  u history  d download  q quit"
 	} else {
 		help = "esc back  i compose  u load older messages  d download latest media  q quit"
 	}
@@ -1105,6 +1117,9 @@ func (m Model) threadBody(messageHeight, width int) string {
 
 func (m Model) composerBody(width int) string {
 	if m.composing {
+		if width > 0 {
+			m.composer.SetWidth(max(12, width))
+		}
 		body := []string{m.renderComposeToolbar(width)}
 		if m.filePickerOpen {
 			body = append(body, m.renderFilePicker(width))
@@ -1115,7 +1130,7 @@ func (m Model) composerBody(width int) string {
 		}
 		return strings.Join(body, "\n")
 	}
-	return mutedStyle.Render("Press i to compose. Use + for files, Ctrl+V for a screenshot, or Alt+V for a voice note.")
+	return mutedStyle.Render("Press i to compose. Use the + button or Ctrl+O for files, Ctrl+V for a screenshot, or Alt+V for a voice note.")
 }
 
 func (m *Model) nextImagePlaceholder() string {
@@ -1137,6 +1152,10 @@ func (m *Model) clearPendingAttachments() {
 	m.pendingAttachments = nil
 	m.nextImageID = 0
 	m.nextVoiceID = 0
+}
+
+func (m *Model) insertComposerText(text string) {
+	m.composer.InsertString(text)
 }
 
 func (m Model) renderComposeToolbar(width int) string {

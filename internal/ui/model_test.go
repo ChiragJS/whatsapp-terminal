@@ -642,7 +642,7 @@ func TestThreadComposeSendsGenericMediaCommand(t *testing.T) {
 	}
 }
 
-func TestThreadComposePlusOpensFilePickerAndStagesAttachment(t *testing.T) {
+func TestThreadComposeCtrlOOpensFilePickerAndStagesAttachment(t *testing.T) {
 	t.Parallel()
 
 	repo := seededRepo(t)
@@ -662,7 +662,7 @@ func TestThreadComposePlusOpensFilePickerAndStagesAttachment(t *testing.T) {
 	m.composing = true
 	m.filePickerDir = dir
 
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'+'}})
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
 	model := updated.(Model)
 	if !model.filePickerOpen {
 		t.Fatal("expected file picker to open")
@@ -684,6 +684,53 @@ func TestThreadComposePlusOpensFilePickerAndStagesAttachment(t *testing.T) {
 	}
 	if !strings.Contains(model.composer.Value(), "brief.pdf") {
 		t.Fatalf("composer value = %q, want attachment token with file name", model.composer.Value())
+	}
+}
+
+func TestThreadComposePlusInsertsLiteralPlus(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'+'}})
+	model := updated.(Model)
+	if model.filePickerOpen {
+		t.Fatal("did not expect file picker to open")
+	}
+	if model.composer.Value() != "+" {
+		t.Fatalf("composer value = %q, want \"+\"", model.composer.Value())
+	}
+}
+
+func TestThreadComposeCtrlJInsertsNewline(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.composer.SetValue("hello")
+	m.composer.SetCursor(5)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	model := updated.(Model)
+	if got := model.composer.Value(); got != "hello\n" {
+		t.Fatalf("composer value = %q, want %q", got, "hello\n")
 	}
 }
 
