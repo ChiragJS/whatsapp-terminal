@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -151,7 +152,7 @@ func (t *Transport) recordOutgoingMedia(ctx context.Context, chatJID, path, capt
 		MediaKind:     storedKind,
 		MediaMIME:     detectMIME(path),
 		MediaFileName: filepath.Base(path),
-		MediaSeconds:  uint32(duration.Round(time.Second) / time.Second),
+		MediaSeconds:  durationSeconds(duration),
 	}
 	if err := t.repo.RecordMessage(ctx, msg, false); err != nil {
 		return err
@@ -231,6 +232,7 @@ func detectMIME(path string) string {
 	if mimeType != "" {
 		return mimeType
 	}
+	// #nosec G304 -- path is a user-selected local attachment path in demo mode.
 	file, err := os.Open(path)
 	if err != nil {
 		return "application/octet-stream"
@@ -398,4 +400,15 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func durationSeconds(duration time.Duration) uint32 {
+	seconds := duration.Round(time.Second) / time.Second
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds > time.Duration(math.MaxUint32) {
+		return math.MaxUint32
+	}
+	return uint32(seconds)
 }

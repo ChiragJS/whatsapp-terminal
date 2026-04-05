@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -332,7 +333,7 @@ func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, increment
 	)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, msg.ChatJID, msg.ID, msg.SenderJID, msg.SenderName, msg.Text, timeString(msg.Timestamp), boolToInt(msg.FromMe), string(msg.Receipt), boolToInt(msg.IsGroup),
-		string(msg.MediaKind), msg.MediaMIME, msg.MediaFileName, msg.MediaDirectPath, int64(msg.MediaFileLength), int64(msg.MediaSeconds),
+		string(msg.MediaKind), msg.MediaMIME, msg.MediaFileName, msg.MediaDirectPath, clampUint64ToInt64(msg.MediaFileLength), int64(msg.MediaSeconds),
 		msg.MediaKey, msg.MediaFileSHA256, msg.MediaFileEncSHA256, msg.DownloadedPath)
 	if err != nil {
 		return fmt.Errorf("insert message %s: %w", msg.ID, err)
@@ -739,7 +740,31 @@ func scanStoredMessage(scanner rowScanner) (domain.Message, error) {
 	msg.Receipt = domain.ReceiptState(receipt)
 	msg.IsGroup = isGroup == 1
 	msg.MediaKind = domain.MediaKind(mediaKind)
-	msg.MediaFileLength = uint64(maxInt64(mediaFileLength, 0))
-	msg.MediaSeconds = uint32(maxInt64(mediaSeconds, 0))
+	msg.MediaFileLength = clampInt64ToUint64(mediaFileLength)
+	msg.MediaSeconds = clampInt64ToUint32(mediaSeconds)
 	return msg, nil
+}
+
+func clampUint64ToInt64(value uint64) int64 {
+	if value > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(value)
+}
+
+func clampInt64ToUint64(value int64) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
+}
+
+func clampInt64ToUint32(value int64) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(value)
 }

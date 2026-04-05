@@ -181,6 +181,7 @@ func (a *Adapter) DownloadMedia(ctx context.Context, msg domain.Message, downloa
 	}
 
 	targetPath := filepath.Join(downloadDir, downloadFileName(msg))
+	// #nosec G304 -- downloadDir is an application-controlled directory for user-requested media exports.
 	file, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create media file: %w", err)
@@ -202,7 +203,7 @@ func (a *Adapter) DownloadMedia(ctx context.Context, msg domain.Message, downloa
 		msg.MediaFileEncSHA256,
 		msg.MediaFileSHA256,
 		msg.MediaKey,
-		int(msg.MediaFileLength),
+		clampUint64ToInt(msg.MediaFileLength),
 		mediaType,
 		mediaDownloadMIMEType(mediaType),
 		file,
@@ -274,7 +275,7 @@ func (a *Adapter) RequestHistory(ctx context.Context, chatJID string, count int)
 			a.emit(domain.Event{Type: domain.EventStatus, Status: "Requested chat history from the primary device"})
 			return nil
 		}
-		if err := a.requestRecentHistorySync(ctx, 30, uint32(max(count, 12))); err != nil {
+		if err := a.requestRecentHistorySync(ctx, 30, clampIntToUint32(max(count, 12))); err != nil {
 			return fmt.Errorf("request recent history sync: %w", err)
 		}
 		a.emit(domain.Event{Type: domain.EventStatus, Status: "Requested recent chats from the primary device"})
@@ -307,6 +308,7 @@ func (a *Adapter) sendUploadedMedia(ctx context.Context, chatJID, path, caption 
 	if client == nil {
 		return errors.New("client is not ready")
 	}
+	// #nosec G304 -- path is a user-selected local attachment path.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read media: %w", err)
@@ -351,7 +353,7 @@ func (a *Adapter) sendUploadedMedia(ctx context.Context, chatJID, path, caption 
 		MediaFileName:      filepath.Base(path),
 		MediaDirectPath:    upload.DirectPath,
 		MediaFileLength:    upload.FileLength,
-		MediaSeconds:       uint32(duration.Round(time.Second) / time.Second),
+		MediaSeconds:       durationSeconds(duration),
 		MediaKey:           upload.MediaKey,
 		MediaFileSHA256:    upload.FileSHA256,
 		MediaFileEncSHA256: upload.FileEncSHA256,
@@ -994,7 +996,7 @@ func (a *Adapter) requestRecentHistorySync(ctx context.Context, days, maxMessage
 						SupportGroupHistory:           proto.Bool(true),
 					},
 					FullHistorySyncOnDemandConfig: &waE2E.FullHistorySyncOnDemandConfig{
-						HistoryFromTimestamp: proto.Uint64(uint64(since.Unix())),
+						HistoryFromTimestamp: proto.Uint64(unixSecondsToUint64(since)),
 						HistoryDurationDays:  proto.Uint32(days),
 					},
 				},
@@ -1240,6 +1242,7 @@ func applyMediaMetadata(msg *domain.Message, message *waE2E.Message) {
 }
 
 func detectOutgoingMedia(path string) (domain.MediaKind, string, error) {
+	// #nosec G304 -- path is a user-selected local attachment path.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return domain.MediaKindNone, "", fmt.Errorf("read media file: %w", err)
@@ -1316,10 +1319,10 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 			FileLength:    proto.Uint64(upload.FileLength),
 		}
 		if cfg.Width > 0 {
-			imageMsg.Width = proto.Uint32(uint32(cfg.Width))
+			imageMsg.Width = proto.Uint32(clampIntToUint32(cfg.Width))
 		}
 		if cfg.Height > 0 {
-			imageMsg.Height = proto.Uint32(uint32(cfg.Height))
+			imageMsg.Height = proto.Uint32(clampIntToUint32(cfg.Height))
 		}
 		return &waE2E.Message{ImageMessage: imageMsg}, mediaPreview(domain.MediaKindImage, base, caption), domain.MediaKindImage, nil
 	case domain.MediaKindVideo:
@@ -1335,7 +1338,7 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 		}
 		return &waE2E.Message{VideoMessage: videoMsg}, mediaPreview(domain.MediaKindVideo, base, caption), domain.MediaKindVideo, nil
 	case domain.MediaKindVoice:
-		seconds := uint32(duration.Round(time.Second) / time.Second)
+		seconds := durationSeconds(duration)
 		audioMsg := &waE2E.AudioMessage{
 			Mimetype:      proto.String(mimeType),
 			URL:           proto.String(upload.URL),
@@ -1448,4 +1451,40 @@ func unixTimeFromUint64(seconds uint64) time.Time {
 		seconds = math.MaxInt64
 	}
 	return time.Unix(int64(seconds), 0).UTC()
+}
+
+func unixSecondsToUint64(ts time.Time) uint64 {
+	seconds := ts.Unix()
+	if seconds <= 0 {
+		return 0
+	}
+	return uint64(seconds)
+}
+
+func clampUint64ToInt(value uint64) int {
+	if value > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(value)
+}
+
+func clampIntToUint32(value int) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(value)
+}
+
+func durationSeconds(duration time.Duration) uint32 {
+	seconds := duration.Round(time.Second) / time.Second
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds > time.Duration(math.MaxUint32) {
+		return math.MaxUint32
+	}
+	return uint32(seconds)
 }

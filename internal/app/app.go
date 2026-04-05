@@ -64,6 +64,7 @@ func openLogSink(cfg config.Config) (io.Writer, func(), error) {
 		return io.Discard, func() {}, nil
 	}
 	path := filepath.Join(cfg.DataDir, "debug.log")
+	// #nosec G304 -- path is constrained to the configured application data directory.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open debug log: %w", err)

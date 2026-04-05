@@ -64,6 +64,7 @@ func (r *systemVoiceRecorder) Start() error {
 		"filesink",
 		"location=" + path,
 	}
+	// #nosec G204 -- command and arguments are assembled from fixed internal values, not user input.
 	cmd := exec.Command("gst-launch-1.0", args...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard

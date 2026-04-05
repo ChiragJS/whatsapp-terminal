@@ -52,7 +52,11 @@ func readWaylandClipboardImage() ([]byte, error) {
 	if !strings.Contains(string(out), "image/png") {
 		return nil, fmt.Errorf("clipboard does not currently contain a PNG image")
 	}
-	return readClipboardCommand("wl-paste", "--no-newline", "--type", "image/png")
+	data, err := exec.Command("wl-paste", "--no-newline", "--type", "image/png").Output()
+	if err != nil {
+		return nil, err
+	}
+	return validateClipboardImage(data)
 }
 
 func readX11ClipboardImage() ([]byte, error) {
@@ -66,22 +70,25 @@ func readX11ClipboardImage() ([]byte, error) {
 	if !strings.Contains(string(out), "image/png") {
 		return nil, fmt.Errorf("clipboard does not currently contain a PNG image")
 	}
-	return readClipboardCommand("xclip", "-selection", "clipboard", "-t", "image/png", "-o")
+	data, err := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png", "-o").Output()
+	if err != nil {
+		return nil, err
+	}
+	return validateClipboardImage(data)
 }
 
 func readMacClipboardImage() ([]byte, error) {
 	if _, err := exec.LookPath("pngpaste"); err != nil {
 		return nil, fmt.Errorf("clipboard image access unavailable: install pngpaste")
 	}
-	return readClipboardCommand("pngpaste", "-")
-}
-
-func readClipboardCommand(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
-	data, err := cmd.Output()
+	data, err := exec.Command("pngpaste", "-").Output()
 	if err != nil {
 		return nil, err
 	}
+	return validateClipboardImage(data)
+}
+
+func validateClipboardImage(data []byte) ([]byte, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, fmt.Errorf("clipboard does not currently contain an image")
 	}
