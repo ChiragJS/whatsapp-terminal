@@ -11,6 +11,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -515,7 +516,7 @@ func (a *Adapter) handleHistorySync(ctx context.Context, sync *waHistorySync.His
 			chat.LastMessageAt = latest.Timestamp
 		}
 		if chat.LastMessageAt.IsZero() && conversation.GetConversationTimestamp() > 0 {
-			chat.LastMessageAt = time.Unix(int64(conversation.GetConversationTimestamp()), 0).UTC()
+			chat.LastMessageAt = unixTimeFromUint64(conversation.GetConversationTimestamp())
 		}
 
 		if err := a.repo.UpsertChat(ctx, chat); err != nil {
@@ -756,7 +757,7 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 		SenderJID:  sender.ToNonAD().String(),
 		SenderName: a.resolveSenderName(ctx, sender.ToNonAD(), ""),
 		Text:       extractText(message),
-		Timestamp:  time.Unix(int64(webMsg.GetMessageTimestamp()), 0).UTC(),
+		Timestamp:  unixTimeFromUint64(webMsg.GetMessageTimestamp()),
 		FromMe:     key.GetFromMe(),
 		Receipt:    receiptForIncoming(key.GetFromMe()),
 		IsGroup:    chatJID.Server == types.GroupServer,
@@ -1437,4 +1438,14 @@ func receiptForIncoming(fromMe bool) domain.ReceiptState {
 		return domain.ReceiptStateSent
 	}
 	return domain.ReceiptStateReceived
+}
+
+func unixTimeFromUint64(seconds uint64) time.Time {
+	if seconds == 0 {
+		return time.Time{}
+	}
+	if seconds > math.MaxInt64 {
+		seconds = math.MaxInt64
+	}
+	return time.Unix(int64(seconds), 0).UTC()
 }
