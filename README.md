@@ -61,6 +61,20 @@ Tagged releases publish cross-platform binaries to GitHub Releases through GoRel
 - macOS: `amd64`, `arm64`
 - Windows: `amd64`, `arm64`
 
+One-command installer for Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ChiragJS/whatsapp-terminal/main/scripts/install.sh | sh
+```
+
+The installer detects OS and CPU, downloads the latest release archive plus `checksums.txt`, verifies the SHA-256 checksum, installs the binary to `/usr/local/bin` when writable or `~/.local/bin` otherwise, and prints the final path.
+
+To pin a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ChiragJS/whatsapp-terminal/main/scripts/install.sh | RELEASE_TAG=v0.1.0 sh
+```
+
 Release flow:
 
 ```bash
