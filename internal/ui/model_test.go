@@ -122,6 +122,18 @@ func (f *fakeVoiceRecorder) Cancel() error {
 	return nil
 }
 
+func assertQuitCmd(t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+
+	if cmd == nil {
+		t.Fatal("expected quit command")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("cmd() type = %T, want tea.QuitMsg", msg)
+	}
+}
+
 func TestModelOpensSelectedThread(t *testing.T) {
 	t.Parallel()
 
@@ -273,6 +285,73 @@ func TestSearchFiltersChatList(t *testing.T) {
 	if model.chats[0].Title != "Alice Mercer" {
 		t.Fatalf("model.chats[0].Title = %q, want Alice Mercer", model.chats[0].Title)
 	}
+}
+
+func TestChatListRequiresEscapeBeforeQuit(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 24
+	m.ready = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model := updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect q to quit without escape")
+	}
+	if model.quitArmed {
+		t.Fatal("did not expect quit to stay armed after q")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if !model.quitArmed {
+		t.Fatal("expected escape to arm quit from the chat list")
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	_ = updated.(Model)
+	assertQuitCmd(t, cmd)
+}
+
+func TestSearchTypingQDoesNotQuit(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 24
+	m.ready = true
+	m.searching = true
+	m.search.Focus()
+	m.search.SetValue("al")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model := updated.(Model)
+	if got := model.search.Value(); got != "alq" {
+		t.Fatalf("search value = %q, want %q", got, "alq")
+	}
+	if !model.searching {
+		t.Fatal("expected search mode to stay active while typing")
+	}
+	if cmd == nil {
+		t.Fatal("expected search update command")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.searching {
+		t.Fatal("expected escape to exit search mode")
+	}
+	if !model.quitArmed {
+		t.Fatal("expected escape to arm quit after leaving search")
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	_ = updated.(Model)
+	assertQuitCmd(t, cmd)
 }
 
 func TestSearchIncludesContactWithoutCachedChat(t *testing.T) {
@@ -642,6 +721,43 @@ func TestThreadComposeSendsGenericMediaCommand(t *testing.T) {
 	}
 }
 
+func TestThreadComposeTypingQDoesNotQuit(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.composer.Focus()
+	m.composer.SetValue("hello")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model := updated.(Model)
+	if got := model.composer.Value(); got != "helloq" {
+		t.Fatalf("composer value = %q, want %q", got, "helloq")
+	}
+	if cmd == nil {
+		t.Fatal("expected composer update command")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.composing {
+		t.Fatal("expected escape to leave compose mode")
+	}
+	if !model.quitArmed {
+		t.Fatal("expected escape to arm quit after leaving compose mode")
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	_ = updated.(Model)
+	assertQuitCmd(t, cmd)
+}
+
 func TestThreadComposeCtrlOOpensFilePickerAndStagesAttachment(t *testing.T) {
 	t.Parallel()
 
@@ -684,6 +800,41 @@ func TestThreadComposeCtrlOOpensFilePickerAndStagesAttachment(t *testing.T) {
 	}
 	if !strings.Contains(model.composer.Value(), "brief.pdf") {
 		t.Fatalf("composer value = %q, want attachment token with file name", model.composer.Value())
+	}
+}
+
+func TestFilePickerEscapeDoesNotArmQuit(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.filePickerOpen = true
+	m.filePickerEntries = []filePickerEntry{{name: "brief.pdf", path: "/tmp/brief.pdf"}}
+	m.composer.Focus()
+	m.composer.SetValue("draft")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := updated.(Model)
+	if model.filePickerOpen {
+		t.Fatal("expected escape to close the file picker")
+	}
+	if model.quitArmed {
+		t.Fatal("did not expect file picker escape to arm quit while composing")
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model = updated.(Model)
+	if got := model.composer.Value(); got != "draftq" {
+		t.Fatalf("composer value = %q, want %q", got, "draftq")
+	}
+	if cmd == nil {
+		t.Fatal("expected composer update command")
 	}
 }
 
@@ -731,6 +882,32 @@ func TestThreadComposeCtrlJInsertsNewline(t *testing.T) {
 	model := updated.(Model)
 	if got := model.composer.Value(); got != "hello\n" {
 		t.Fatalf("composer value = %q, want %q", got, "hello\n")
+	}
+}
+
+func TestThreadComposeExpandsForMultilineDraft(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.composer.Focus()
+	m.composer.SetValue("hello\nmy name is Chirag\n- hello")
+
+	m.resizeComposer(80, 8)
+	view := m.composerBody(80)
+	if !strings.Contains(view, "hello") || !strings.Contains(view, "my name is Chirag") || !strings.Contains(view, "- hello") {
+		t.Fatalf("thread view missing multiline draft:\n%s", view)
+	}
+	if got := m.composer.Height(); got <= 3 {
+		t.Fatalf("composer height = %d, want > 3 for multiline draft", got)
 	}
 }
 
@@ -980,6 +1157,149 @@ func TestThreadRequestsHistory(t *testing.T) {
 	}
 }
 
+func TestThreadScrollsMessageWindow(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 20)
+	m.threadMessageLimit = messageLimit
+
+	body := ansiPattern.ReplaceAllString(m.threadBody(5, 80), "")
+	if !strings.Contains(body, "Message 20") {
+		t.Fatalf("initial body missing latest message:\n%s", body)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model := updated.(Model)
+	if model.threadScroll != 1 {
+		t.Fatalf("threadScroll = %d, want 1", model.threadScroll)
+	}
+	body = ansiPattern.ReplaceAllString(model.threadBody(5, 80), "")
+	if strings.Contains(body, "Message 20") || !strings.Contains(body, "Message 19") {
+		t.Fatalf("scrolled body = %q, want previous window without latest", body)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = updated.(Model)
+	if model.threadScroll != 0 {
+		t.Fatalf("threadScroll after down = %d, want 0", model.threadScroll)
+	}
+}
+
+func TestThreadScrollRequestsHistoryAtOldestMessage(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 1)
+	m.threadMessageLimit = messageLimit
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model := updated.(Model)
+	if !model.threadHistoryPending {
+		t.Fatal("expected history request to be pending")
+	}
+	if cmd == nil {
+		t.Fatal("expected history request command")
+	}
+
+	msg := cmd()
+	result, ok := msg.(opResultMsg)
+	if !ok {
+		t.Fatalf("cmd() type = %T, want opResultMsg", msg)
+	}
+	if result.err != nil {
+		t.Fatalf("history result error = %v", result.err)
+	}
+	if transport.historyChat != "project-alpha@g.us" {
+		t.Fatalf("historyChat = %q, want project-alpha@g.us", transport.historyChat)
+	}
+	if transport.historyCount != historyRequestCount {
+		t.Fatalf("historyCount = %d, want %d", transport.historyCount, historyRequestCount)
+	}
+}
+
+func TestThreadScrollLoadsOlderCachedMessages(t *testing.T) {
+	t.Parallel()
+
+	repo, err := appstore.New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "project-alpha@g.us"
+	for _, msg := range makeThreadMessages(chatJID, messageLimit+5) {
+		if err := repo.RecordMessage(ctx, msg, false); err != nil {
+			t.Fatalf("RecordMessage(%s) error = %v", msg.ID, err)
+		}
+	}
+	initial, err := repo.ListMessages(ctx, chatJID, messageLimit)
+	if err != nil {
+		t.Fatalf("ListMessages(initial) error = %v", err)
+	}
+	if len(initial) != messageLimit {
+		t.Fatalf("len(initial) = %d, want %d", len(initial), messageLimit)
+	}
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = chatJID
+	m.messages = initial
+	m.threadMessageLimit = messageLimit
+	m.threadScroll = len(initial) - 1
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model := updated.(Model)
+	if !model.threadLoadingOlder {
+		t.Fatal("expected older cached load to be pending")
+	}
+	if model.threadMessageLimit != messageLimit+messagePageSize {
+		t.Fatalf("threadMessageLimit = %d, want %d", model.threadMessageLimit, messageLimit+messagePageSize)
+	}
+	if cmd == nil {
+		t.Fatal("expected load messages command")
+	}
+
+	msg := cmd()
+	loaded, ok := msg.(messagesLoadedMsg)
+	if !ok {
+		t.Fatalf("cmd() type = %T, want messagesLoadedMsg", msg)
+	}
+	if len(loaded.messages) != messageLimit+5 {
+		t.Fatalf("len(loaded.messages) = %d, want %d", len(loaded.messages), messageLimit+5)
+	}
+
+	updated, _ = model.Update(loaded)
+	model = updated.(Model)
+	if len(model.messages) != messageLimit+5 {
+		t.Fatalf("len(model.messages) = %d, want %d", len(model.messages), messageLimit+5)
+	}
+	if model.threadLoadingOlder {
+		t.Fatal("expected older cached load to complete")
+	}
+	if transport.historyChat != "" {
+		t.Fatalf("historyChat = %q, want no network history request", transport.historyChat)
+	}
+}
+
 func TestPairingViewFitsTerminalWidth(t *testing.T) {
 	t.Parallel()
 
@@ -1153,7 +1473,7 @@ func TestFooterWithErrorFitsTerminalWidth(t *testing.T) {
 	m.ready = true
 	m.lastErr = "database is locked (5) (SQLITE_BUSY)"
 
-	view := m.renderFooter("j/k move  enter open  / search  r refresh  q quit")
+	view := m.renderFooter("j/k move  enter open  / search  r refresh  esc then q quit")
 	assertViewFitsWidth(t, view, m.width)
 	if !strings.Contains(view, "SQLITE_BUSY") {
 		t.Fatalf("footer missing error text:\n%s", view)
@@ -1228,6 +1548,23 @@ func seededRepo(t *testing.T) *appstore.Store {
 	}
 
 	return repo
+}
+
+func makeThreadMessages(chatJID string, count int) []domain.Message {
+	base := time.Date(2026, 4, 5, 18, 0, 0, 0, time.UTC)
+	messages := make([]domain.Message, 0, count)
+	for i := 0; i < count; i++ {
+		messages = append(messages, domain.Message{
+			ID:        fmt.Sprintf("thread-%03d", i+1),
+			ChatJID:   chatJID,
+			SenderJID: chatJID,
+			Text:      fmt.Sprintf("Message %d", i+1),
+			Timestamp: base.Add(time.Duration(i) * time.Minute),
+			Receipt:   domain.ReceiptStateReceived,
+			IsGroup:   strings.HasSuffix(chatJID, "@g.us"),
+		})
+	}
+	return messages
 }
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)

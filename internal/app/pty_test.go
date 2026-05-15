@@ -43,6 +43,11 @@ func TestDemoModePTYSmoke(t *testing.T) {
 	waitForSubstring(t, &out, "esc back")
 	waitForSubstring(t, &out, "I’ll review the summary tonight")
 
+	if _, err := ptmx.Write([]byte("\x1b")); err != nil {
+		t.Fatalf("write escape error = %v", err)
+	}
+	waitForSubstringCount(t, &out, "Press / to search chats by name or JID", 2)
+
 	if _, err := ptmx.Write([]byte("q")); err != nil {
 		t.Fatalf("write quit error = %v", err)
 	}
@@ -77,4 +82,17 @@ func waitForSubstring(t *testing.T, out *bytes.Buffer, needle string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %q\noutput:\n%s", needle, out.String())
+}
+
+func waitForSubstringCount(t *testing.T, out *bytes.Buffer, needle string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Count(out.String(), needle) >= want {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q to appear %d times\noutput:\n%s", needle, want, out.String())
 }

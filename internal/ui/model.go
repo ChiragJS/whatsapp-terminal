@@ -24,6 +24,11 @@ const (
 	chatListLimit        = 200
 	defaultChatListLimit = 5
 	messageLimit         = 200
+	messagePageSize      = 100
+	historyRequestCount  = 50
+	threadPrefetchMargin = 5
+	threadPageScroll     = 8
+	threadMouseScroll    = 3
 	maxPathSuggestions   = 5
 )
 
@@ -46,6 +51,7 @@ type chatsLoadedMsg struct {
 type messagesLoadedMsg struct {
 	chatJID  string
 	messages []domain.Message
+	limit    int
 	err      error
 }
 
@@ -56,6 +62,7 @@ type opResultMsg struct {
 	refresh          bool
 	clearComposer    bool
 	clearAttachments bool
+	historyRequest   bool
 }
 
 type composeActionType int
@@ -140,6 +147,10 @@ type Model struct {
 	filePickerEntries    []filePickerEntry
 	filePickerSelected   int
 	threadHistoryPending bool
+	threadLoadingOlder   bool
+	threadMessageLimit   int
+	threadScroll         int
+	quitArmed            bool
 }
 
 func NewModel(repo *appstore.Store, transport domain.Transport) Model {
@@ -202,6 +213,19 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(tea.ClearScreen, waitForTransportEvent(m.events), loadChatsCmd(m.repo, ""))
 }
 
+func (m Model) canQuitWithKey() bool {
+	return !m.searching && !m.composing
+}
+
+func (m Model) requestQuit() (tea.Model, tea.Cmd) {
+	if m.recordingVoice && m.recorder != nil {
+		_ = m.recorder.Cancel()
+	}
+	m.clearPendingAttachments()
+	m.quitArmed = false
+	return m, tea.Quit
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -213,7 +237,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.applyTransportEvent(msg.event)
 		cmds := []tea.Cmd{waitForTransportEvent(m.events), loadChatsCmd(m.repo, m.search.Value())}
 		if m.currentChatID != "" {
-			cmds = append(cmds, loadMessagesCmd(m.repo, m.currentChatID))
+			cmds = append(cmds, loadMessagesCmd(m.repo, m.currentChatID, m.messageLoadLimit()))
 		}
 		if msg.event.Notify && m.sounder != nil {
 			_ = m.sounder.Bell()
@@ -242,24 +266,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.redrawCmd()
 	case messagesLoadedMsg:
 		if msg.err != nil {
+			if msg.chatJID == m.currentChatID {
+				m.threadLoadingOlder = false
+			}
 			m.lastErr = msg.err.Error()
 			return m, m.redrawCmd()
 		}
 		if msg.chatJID == m.currentChatID {
+			previousLen := len(m.messages)
+			previousOldestID := oldestMessageID(m.messages)
+			previousNewestID := newestMessageID(m.messages)
+			wasAtBottom := m.threadScroll == 0
+			wasLoadingOlder := m.threadLoadingOlder
+
+			m.threadLoadingOlder = false
+			if msg.limit > 0 {
+				m.threadMessageLimit = max(m.threadMessageLimit, msg.limit)
+			} else if m.threadMessageLimit == 0 {
+				m.threadMessageLimit = messageLimit
+			}
 			m.messages = msg.messages
+			if wasAtBottom {
+				m.threadScroll = 0
+			} else if previousNewestID != "" && newestMessageID(msg.messages) != previousNewestID && len(msg.messages) > previousLen {
+				m.threadScroll += len(msg.messages) - previousLen
+			}
+			m.threadScroll = clampThreadScroll(m.threadScroll, len(m.messages))
 			if len(msg.messages) == 0 && m.mode == viewThread && !m.threadHistoryPending {
-				m.threadHistoryPending = true
-				m.status = "Requesting messages for this chat..."
-				return m, tea.Batch(m.redrawCmd(), requestHistoryCmd(m.transport, msg.chatJID, 50))
+				var cmd tea.Cmd
+				m, cmd = m.loadOlderThreadMessages()
+				return m, batchCommands(m.redrawCmd(), cmd)
 			}
 			if len(msg.messages) > 0 {
 				m.threadHistoryPending = false
+			}
+			if wasLoadingOlder && previousOldestID != "" && oldestMessageID(msg.messages) == previousOldestID && m.threadNearOldestBoundary() {
+				var cmd tea.Cmd
+				m, cmd = m.loadOlderThreadMessages()
+				return m, batchCommands(m.redrawCmd(), cmd)
 			}
 		}
 		return m, m.redrawCmd()
 	case opResultMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
+			if msg.historyRequest {
+				m.threadHistoryPending = false
+			}
 		}
 		if msg.status != "" {
 			m.status = msg.status
@@ -281,7 +334,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(
 				m.redrawCmd(),
 				loadChatsCmd(m.repo, m.search.Value()),
-				loadMessagesCmd(m.repo, msg.chatJID),
+				loadMessagesCmd(m.repo, msg.chatJID, m.messageLoadLimit()),
 			)
 		}
 		return m, m.redrawCmd()
@@ -301,12 +354,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.redrawCmd()
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
-			if m.recordingVoice && m.recorder != nil {
-				_ = m.recorder.Cancel()
+		case "ctrl+c":
+			return m.requestQuit()
+		case "q":
+			if m.quitArmed && m.canQuitWithKey() {
+				return m.requestQuit()
 			}
-			m.clearPendingAttachments()
-			return m, tea.Quit
+			m.quitArmed = false
+		case "esc":
+		default:
+			m.quitArmed = false
 		}
 	}
 
@@ -340,6 +397,7 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.searching = false
+				m.quitArmed = true
 				m.search.Blur()
 				m.search.SetValue("")
 				return m, tea.Batch(m.redrawCmd(), loadChatsCmd(m.repo, ""))
@@ -354,6 +412,9 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "esc":
+			m.quitArmed = true
+			return m, m.redrawCmd()
 		case "/":
 			m.searching = true
 			m.search.Focus()
@@ -375,10 +436,13 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentChatID = chat.JID
 			m.messages = nil
 			m.threadHistoryPending = false
+			m.threadLoadingOlder = false
+			m.threadMessageLimit = messageLimit
+			m.threadScroll = 0
 			return m, tea.Batch(
 				m.redrawCmd(),
 				resetUnreadCmd(m.repo, chat.JID),
-				loadMessagesCmd(m.repo, chat.JID),
+				loadMessagesCmd(m.repo, chat.JID, m.messageLoadLimit()),
 				loadChatsCmd(m.repo, m.search.Value()),
 			)
 		}
@@ -390,6 +454,12 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.MouseMsg:
 		if !m.composing {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				return m.scrollThread(threadMouseScroll)
+			case tea.MouseButtonWheelDown:
+				return m.scrollThread(-threadMouseScroll)
+			}
 			return m, nil
 		}
 		if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
@@ -433,6 +503,7 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.redrawCmd()
 				}
 				m.composing = false
+				m.quitArmed = true
 				m.composer.Blur()
 				if m.recordingVoice && m.recorder != nil {
 					_ = m.recorder.Cancel()
@@ -535,7 +606,11 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentChatID = ""
 			m.messages = nil
 			m.threadHistoryPending = false
+			m.threadLoadingOlder = false
+			m.threadMessageLimit = 0
+			m.threadScroll = 0
 			m.composing = false
+			m.quitArmed = true
 			m.composer.Blur()
 			if m.recordingVoice && m.recorder != nil {
 				_ = m.recorder.Cancel()
@@ -548,11 +623,29 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composing = true
 			m.refreshPathSuggestions()
 			return m, tea.Batch(m.redrawCmd(), m.composer.Focus())
+		case "k", "up":
+			return m.scrollThread(1)
+		case "j", "down":
+			return m.scrollThread(-1)
+		case "pgup", "ctrl+u":
+			return m.scrollThread(threadPageScroll)
+		case "pgdown", "ctrl+d":
+			return m.scrollThread(-threadPageScroll)
+		case "home":
+			return m.scrollThread(len(m.messages))
+		case "end":
+			if m.threadScroll == 0 {
+				return m, nil
+			}
+			m.threadScroll = 0
+			return m, m.redrawCmd()
 		case "u":
 			if m.currentChatID == "" {
 				return m, nil
 			}
-			return m, requestHistoryCmd(m.transport, m.currentChatID, 50)
+			var cmd tea.Cmd
+			m, cmd = m.loadOlderThreadMessages()
+			return m, batchCommands(m.redrawCmd(), cmd)
 		case "d":
 			if m.currentChatID == "" {
 				return m, nil
@@ -566,6 +659,61 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
+	if delta == 0 || m.currentChatID == "" {
+		return m, nil
+	}
+
+	stateChanged := false
+	if len(m.messages) > 0 {
+		previousScroll := m.threadScroll
+		m.threadScroll = clampThreadScroll(m.threadScroll+delta, len(m.messages))
+		stateChanged = previousScroll != m.threadScroll
+	}
+
+	var cmd tea.Cmd
+	if delta > 0 && (len(m.messages) == 0 || m.threadNearOldestBoundary()) {
+		m, cmd = m.loadOlderThreadMessages()
+		stateChanged = stateChanged || cmd != nil
+	}
+	if !stateChanged {
+		return m, nil
+	}
+	return m, batchCommands(m.redrawCmd(), cmd)
+}
+
+func (m Model) loadOlderThreadMessages() (Model, tea.Cmd) {
+	if m.currentChatID == "" || m.threadLoadingOlder || m.threadHistoryPending {
+		return m, nil
+	}
+
+	limit := m.messageLoadLimit()
+	if len(m.messages) > 0 && len(m.messages) >= limit {
+		m.threadMessageLimit = limit + messagePageSize
+		m.threadLoadingOlder = true
+		m.status = "Loading older cached messages..."
+		return m, loadMessagesCmd(m.repo, m.currentChatID, m.threadMessageLimit)
+	}
+
+	m.threadHistoryPending = true
+	m.status = "Requesting older messages..."
+	return m, requestHistoryCmd(m.transport, m.currentChatID, historyRequestCount)
+}
+
+func (m Model) messageLoadLimit() int {
+	if m.threadMessageLimit > 0 {
+		return m.threadMessageLimit
+	}
+	return messageLimit
+}
+
+func (m Model) threadNearOldestBoundary() bool {
+	if len(m.messages) == 0 {
+		return true
+	}
+	return m.threadScroll >= max(0, len(m.messages)-threadPrefetchMargin)
 }
 
 func (m Model) applyTransportEvent(event domain.Event) Model {
@@ -610,7 +758,7 @@ func (m Model) renderPairing() string {
 		"",
 		qr,
 		"",
-		mutedStyle.Render("Press q to quit."),
+		mutedStyle.Render("Press esc then q to quit."),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, lipgloss.Place(m.width, max(10, m.height-4), lipgloss.Center, lipgloss.Top, content))
 }
@@ -618,7 +766,7 @@ func (m Model) renderPairing() string {
 func (m Model) renderChatList() string {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader("Inbox", "")
-	footer := m.renderFooter("j/k move  enter open  / search  r refresh  q quit")
+	footer := m.renderFooter("j/k move  enter open  / search  r refresh  esc then q quit")
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
 	if contentWidth < 68 {
 		searchHeight := 3
@@ -644,14 +792,13 @@ func (m Model) renderChatList() string {
 func (m Model) renderThread() string {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader(m.threadTitle(), "")
-	var help string
-	if m.composing {
-		help = "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  u history  d download  q quit"
-	} else {
-		help = "esc back  i compose  u load older messages  d download latest media  q quit"
-	}
-	footer := m.renderFooter(help)
+	footer := m.renderFooter(m.threadHelpText())
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
+	if m.composing {
+		composerWidth := contentWidth - boxMutedStyle.GetHorizontalFrameSize()
+		maxComposerHeight := max(3, bodyHeight/3)
+		m.resizeComposer(composerWidth, maxComposerHeight)
+	}
 	composerContent := m.composerBody(contentWidth - boxMutedStyle.GetHorizontalFrameSize())
 	composerHeight := max(3, countRenderedLines(composerContent)+boxMutedStyle.GetVerticalFrameSize())
 	messageHeight := max(8, bodyHeight-composerHeight)
@@ -659,6 +806,13 @@ func (m Model) renderThread() string {
 	messages := renderPanel(boxStyle, contentWidth, messageHeight, m.threadBody(threadContentHeight, contentWidth-boxStyle.GetHorizontalFrameSize()))
 	composer := renderPanel(boxMutedStyle, contentWidth, composerHeight, composerContent)
 	return lipgloss.JoinVertical(lipgloss.Left, header, messages, composer, footer)
+}
+
+func (m Model) threadHelpText() string {
+	if m.composing {
+		return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  esc then q quit"
+	}
+	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download"
 }
 
 func (m Model) redrawCmd() tea.Cmd {
@@ -716,10 +870,13 @@ func loadChatsCmd(repo *appstore.Store, query string) tea.Cmd {
 	}
 }
 
-func loadMessagesCmd(repo *appstore.Store, chatJID string) tea.Cmd {
+func loadMessagesCmd(repo *appstore.Store, chatJID string, limit int) tea.Cmd {
+	if limit <= 0 {
+		limit = messageLimit
+	}
 	return func() tea.Msg {
-		messages, err := repo.ListMessages(context.Background(), chatJID, messageLimit)
-		return messagesLoadedMsg{chatJID: chatJID, messages: messages, err: err}
+		messages, err := repo.ListMessages(context.Background(), chatJID, limit)
+		return messagesLoadedMsg{chatJID: chatJID, messages: messages, limit: limit, err: err}
 	}
 }
 
@@ -848,7 +1005,11 @@ func sendStagedAttachmentsCmd(transport domain.Transport, chatJID string, attach
 func requestHistoryCmd(transport domain.Transport, chatJID string, count int) tea.Cmd {
 	return func() tea.Msg {
 		err := transport.RequestHistory(context.Background(), chatJID, count)
-		return opResultMsg{err: err}
+		result := opResultMsg{err: err, historyRequest: true}
+		if err == nil {
+			result.status = "Requested older messages"
+		}
+		return result
 	}
 }
 
@@ -877,6 +1038,50 @@ func clampSelection(selected, total int) int {
 		return total - 1
 	}
 	return selected
+}
+
+func clampThreadScroll(scroll, total int) int {
+	if total <= 1 {
+		return 0
+	}
+	if scroll < 0 {
+		return 0
+	}
+	maxScroll := total - 1
+	if scroll > maxScroll {
+		return maxScroll
+	}
+	return scroll
+}
+
+func oldestMessageID(messages []domain.Message) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	return messages[0].ID
+}
+
+func newestMessageID(messages []domain.Message) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	return messages[len(messages)-1].ID
+}
+
+func batchCommands(cmds ...tea.Cmd) tea.Cmd {
+	filtered := make([]tea.Cmd, 0, len(cmds))
+	for _, cmd := range cmds {
+		if cmd != nil {
+			filtered = append(filtered, cmd)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return tea.Batch(filtered...)
 }
 
 func suffix(input string) string {
@@ -1098,7 +1303,11 @@ func (m Model) threadBody(messageHeight, width int) string {
 
 	selected := make([]string, 0, len(rendered))
 	used := 0
-	for idx := len(rendered) - 1; idx >= 0; idx-- {
+	end := len(rendered) - clampThreadScroll(m.threadScroll, len(rendered))
+	if end < 1 {
+		end = 1
+	}
+	for idx := end - 1; idx >= 0; idx-- {
 		extra := rendered[idx].lines
 		if len(selected) > 0 {
 			extra += 1
@@ -1117,9 +1326,6 @@ func (m Model) threadBody(messageHeight, width int) string {
 
 func (m Model) composerBody(width int) string {
 	if m.composing {
-		if width > 0 {
-			m.composer.SetWidth(max(12, width))
-		}
 		body := []string{m.renderComposeToolbar(width)}
 		if m.filePickerOpen {
 			body = append(body, m.renderFilePicker(width))
@@ -1131,6 +1337,16 @@ func (m Model) composerBody(width int) string {
 		return strings.Join(body, "\n")
 	}
 	return mutedStyle.Render("Press i to compose. Use the + button or Ctrl+O for files, Ctrl+V for a screenshot, or Alt+V for a voice note.")
+}
+
+func (m *Model) resizeComposer(width, maxHeight int) {
+	if width <= 0 {
+		return
+	}
+	m.composer.SetWidth(max(12, width))
+	inputWidth := max(8, width-len([]rune(m.composer.Prompt)))
+	targetHeight := clampComposerHeight(wrappedDraftLineCount(m.composer.Value(), inputWidth)+1, maxHeight)
+	m.composer.SetHeight(targetHeight)
 }
 
 func (m *Model) nextImagePlaceholder() string {
@@ -1465,11 +1681,7 @@ func filePathSuggestions(raw string, limit int) []pathSuggestion {
 func (m Model) threadToolbarHit(x, y int) string {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader(m.threadTitle(), "")
-	help := "esc back  i compose  u load older messages  d download latest media  q quit"
-	if m.composing {
-		help = "enter send  esc cancel  + files  alt+v voice  ctrl+v paste image  u history  d download  q quit"
-	}
-	footer := m.renderFooter(help)
+	footer := m.renderFooter(m.threadHelpText())
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
 	composerContent := m.composerBody(contentWidth - boxMutedStyle.GetHorizontalFrameSize())
 	composerHeight := max(3, countRenderedLines(composerContent)+boxMutedStyle.GetVerticalFrameSize())
@@ -1720,6 +1932,35 @@ func countRenderedLines(text string) int {
 		return 0
 	}
 	return len(strings.Split(text, "\n"))
+}
+
+func wrappedDraftLineCount(text string, width int) int {
+	if width <= 0 {
+		return 1
+	}
+	lines := 0
+	for _, line := range strings.Split(text, "\n") {
+		runes := len([]rune(line))
+		if runes == 0 {
+			lines++
+			continue
+		}
+		lines += (runes-1)/width + 1
+	}
+	return max(1, lines)
+}
+
+func clampComposerHeight(lines, maxHeight int) int {
+	if maxHeight < 3 {
+		maxHeight = 3
+	}
+	if lines < 3 {
+		return 3
+	}
+	if lines > maxHeight {
+		return maxHeight
+	}
+	return lines
 }
 
 func paddedContentHeight(totalHeight int) int {
