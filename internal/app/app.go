@@ -43,7 +43,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		}
 	}()
 
-	model := ui.NewModelWithRuntimeOptions(repo, transport, nil, nil, nil, filepath.Join(cfg.DataDir, "downloads"), cfg.NoAltScreen)
+	model := ui.NewModelWithRuntimeOptions(repo, transport, nil, nil, nil, filepath.Join(cfg.DataDir, "downloads"), cfg.NoAltScreen).
+		WithQuitAfterNavigation(cfg.ArmQuitAfterNavigation)
 	options := []tea.ProgramOption{}
 	if !cfg.NoAltScreen {
 		options = append(options, tea.WithAltScreen())

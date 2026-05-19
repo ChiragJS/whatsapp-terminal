@@ -152,6 +152,7 @@ type Model struct {
 	threadMessageLimit   int
 	threadScroll         int
 	quitArmed            bool
+	quitAfterNavigation  bool
 }
 
 func NewModel(repo *appstore.Store, transport domain.Transport) Model {
@@ -212,6 +213,11 @@ func NewModelWithRuntimeOptions(repo *appstore.Store, transport domain.Transport
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(tea.ClearScreen, waitForTransportEvent(m.events), loadChatsCmd(m.repo, ""))
+}
+
+func (m Model) WithQuitAfterNavigation(enabled bool) Model {
+	m.quitAfterNavigation = enabled
+	return m
 }
 
 func (m Model) canQuitWithKey() bool {
@@ -398,7 +404,7 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.searching = false
-				m.quitArmed = true
+				m.quitArmed = m.quitAfterNavigation
 				m.search.Blur()
 				m.search.SetValue("")
 				return m, tea.Batch(m.redrawCmd(), loadChatsCmd(m.repo, ""))
@@ -504,7 +510,7 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.redrawCmd()
 				}
 				m.composing = false
-				m.quitArmed = true
+				m.quitArmed = m.quitAfterNavigation
 				m.composer.Blur()
 				if m.recordingVoice && m.recorder != nil {
 					_ = m.recorder.Cancel()
@@ -611,7 +617,7 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.threadMessageLimit = 0
 			m.threadScroll = 0
 			m.composing = false
-			m.quitArmed = true
+			m.quitArmed = m.quitAfterNavigation
 			m.composer.Blur()
 			if m.recordingVoice && m.recorder != nil {
 				_ = m.recorder.Cancel()
@@ -756,7 +762,10 @@ func (m Model) renderThread() string {
 
 func (m Model) threadHelpText() string {
 	if m.composing {
-		return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  esc then q quit"
+		if m.quitAfterNavigation {
+			return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  esc then q quit"
+		}
+		return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image"
 	}
 	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download"
 }

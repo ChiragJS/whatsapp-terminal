@@ -43,10 +43,18 @@ func TestDemoModePTYSmoke(t *testing.T) {
 	waitForSubstring(t, &out, "esc back")
 	waitForSubstring(t, &out, "I’ll review the summary tonight")
 
+	chatListNeedle := "Press / to search chats by name or JID"
+	chatListRenders := strings.Count(out.String(), chatListNeedle)
 	if _, err := ptmx.Write([]byte("\x1b")); err != nil {
 		t.Fatalf("write escape error = %v", err)
 	}
-	waitForSubstringCount(t, &out, "Press / to search chats by name or JID", 2)
+	waitForSubstringCount(t, &out, chatListNeedle, chatListRenders+1)
+
+	chatListRenders = strings.Count(out.String(), chatListNeedle)
+	if _, err := ptmx.Write([]byte("\x1b")); err != nil {
+		t.Fatalf("write quit escape error = %v", err)
+	}
+	waitForSubstringCount(t, &out, chatListNeedle, chatListRenders+1)
 
 	if _, err := ptmx.Write([]byte("q")); err != nil {
 		t.Fatalf("write quit error = %v", err)

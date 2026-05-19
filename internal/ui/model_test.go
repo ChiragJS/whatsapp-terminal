@@ -316,6 +316,64 @@ func TestChatListRequiresEscapeBeforeQuit(t *testing.T) {
 	assertQuitCmd(t, cmd)
 }
 
+func TestThreadEscapeReturnsToChatListWithoutArmingQuit(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 24
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := updated.(Model)
+	if model.mode != viewChats {
+		t.Fatalf("mode = %v, want viewChats", model.mode)
+	}
+	if model.quitArmed {
+		t.Fatal("did not expect thread escape to arm quit")
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect q to quit after thread escape")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if !model.quitArmed {
+		t.Fatal("expected chat-list escape to arm quit")
+	}
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	_ = updated.(Model)
+	assertQuitCmd(t, cmd)
+}
+
+func TestThreadEscapeCanArmQuitWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)}).WithQuitAfterNavigation(true)
+	m.width = 96
+	m.height = 24
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := updated.(Model)
+	if !model.quitArmed {
+		t.Fatal("expected configured thread escape to arm quit")
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	_ = updated.(Model)
+	assertQuitCmd(t, cmd)
+}
+
 func TestSearchTypingQDoesNotQuit(t *testing.T) {
 	t.Parallel()
 
@@ -345,10 +403,21 @@ func TestSearchTypingQDoesNotQuit(t *testing.T) {
 	if model.searching {
 		t.Fatal("expected escape to exit search mode")
 	}
-	if !model.quitArmed {
-		t.Fatal("expected escape to arm quit after leaving search")
+	if model.quitArmed {
+		t.Fatal("did not expect search escape to arm quit")
 	}
 
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect q to quit after search escape")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if !model.quitArmed {
+		t.Fatal("expected chat-list escape to arm quit")
+	}
 	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	_ = updated.(Model)
 	assertQuitCmd(t, cmd)
@@ -749,10 +818,36 @@ func TestThreadComposeTypingQDoesNotQuit(t *testing.T) {
 	if model.composing {
 		t.Fatal("expected escape to leave compose mode")
 	}
-	if !model.quitArmed {
-		t.Fatal("expected escape to arm quit after leaving compose mode")
+	if model.quitArmed {
+		t.Fatal("did not expect compose escape to arm quit")
 	}
 
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect q to quit after compose escape")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.mode != viewChats {
+		t.Fatalf("mode = %v, want viewChats", model.mode)
+	}
+	if model.quitArmed {
+		t.Fatal("did not expect thread escape after compose to arm quit")
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect q to quit after returning to chat list")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if !model.quitArmed {
+		t.Fatal("expected chat-list escape to arm quit")
+	}
 	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	_ = updated.(Model)
 	assertQuitCmd(t, cmd)

@@ -51,6 +51,7 @@ Useful flags:
 - `--debug`: write structured debug logs to `debug.log`
 - `--demo`: launch with seeded offline data for TUI work
 - `--no-alt-screen`: render in the main terminal buffer instead of the alternate screen
+- `--arm-quit-after-navigation`: let `q` exit after `esc` leaves search, compose, or a thread
 - `--version`: print the embedded release version and exit
 
 ## Releases And Binaries

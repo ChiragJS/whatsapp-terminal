@@ -8,13 +8,14 @@ import (
 )
 
 type Config struct {
-	DataDir     string
-	SessionName string
-	LogLevel    string
-	Debug       bool
-	Demo        bool
-	NoAltScreen bool
-	ShowVersion bool
+	DataDir                string
+	SessionName            string
+	LogLevel               string
+	Debug                  bool
+	Demo                   bool
+	NoAltScreen            bool
+	ArmQuitAfterNavigation bool
+	ShowVersion            bool
 }
 
 func Parse() (Config, error) {
@@ -30,6 +31,7 @@ func Parse() (Config, error) {
 	flag.BoolVar(&cfg.Debug, "debug", false, "enable debug logging to a file under the data directory")
 	flag.BoolVar(&cfg.Demo, "demo", false, "run in offline demo mode with seeded data")
 	flag.BoolVar(&cfg.NoAltScreen, "no-alt-screen", false, "disable terminal alt-screen mode")
+	flag.BoolVar(&cfg.ArmQuitAfterNavigation, "arm-quit-after-navigation", false, "allow q to quit after esc leaves search, compose, or thread views")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version information and exit")
 	flag.Parse()
 
