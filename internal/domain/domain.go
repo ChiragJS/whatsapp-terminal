@@ -86,14 +86,23 @@ type Event struct {
 	Notify  bool
 }
 
+// Transport is the seam between the TUI and a chat network adapter.
+//
+// A successful send method must record the local echo in the Local Cache before
+// returning and emit an EventChatUpdate for the affected chat. RequestHistory
+// only requests remote history; the resulting Message Records arrive later via
+// adapter-owned Local Cache mutation and transport events. DownloadMedia writes
+// the requested file and marks the Message Record downloaded in the Local Cache.
 type Transport interface {
 	Start(context.Context) error
 	Stop() error
 	Events() <-chan Event
+
 	SendText(context.Context, string, string) error
 	SendImage(context.Context, string, string, string) error
 	SendMedia(context.Context, string, string, string) error
 	SendVoiceNote(context.Context, string, string, time.Duration) error
+
 	DownloadMedia(context.Context, Message, string) (string, error)
 	RequestHistory(context.Context, string, int) error
 }

@@ -21,6 +21,10 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+type execContexter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 const chatSummarySelect = `
 SELECT
     chats.jid,
@@ -221,13 +225,37 @@ func NormalizeSearch(input string) string {
 }
 
 func (s *Store) UpsertContact(ctx context.Context, contact domain.Contact) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin contact tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	contact.DisplayName = firstNonEmpty(contact.DisplayName)
+	contact.PushName = firstNonEmpty(contact.PushName)
+	contact.BusinessName = firstNonEmpty(contact.BusinessName)
+
+	row := tx.QueryRowContext(ctx, `
+SELECT display_name, push_name, business_name FROM contacts WHERE jid = ?
+`, contact.JID)
+	var existing domain.Contact
+	err = row.Scan(&existing.DisplayName, &existing.PushName, &existing.BusinessName)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("lookup contact %s: %w", contact.JID, err)
+	}
+	if err == nil {
+		contact.DisplayName = firstNonEmpty(contact.DisplayName, existing.DisplayName)
+		contact.PushName = firstNonEmpty(contact.PushName, existing.PushName)
+		contact.BusinessName = firstNonEmpty(contact.BusinessName, existing.BusinessName)
+	}
+
 	normalized := NormalizeSearch(strings.Join([]string{
 		contact.DisplayName,
 		contact.PushName,
 		contact.BusinessName,
 		contact.JID,
 	}, " "))
-	_, err := s.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO contacts (jid, display_name, push_name, business_name, normalized_name)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(jid) DO UPDATE SET
@@ -238,6 +266,9 @@ ON CONFLICT(jid) DO UPDATE SET
 `, contact.JID, contact.DisplayName, contact.PushName, contact.BusinessName, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert contact %s: %w", contact.JID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit contact tx: %w", err)
 	}
 	return nil
 }
@@ -265,7 +296,11 @@ func (s *Store) UpsertChat(ctx context.Context, chat domain.ChatSummary) error {
 	if ignoredChatJID(chat.JID) {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	return upsertChat(ctx, s.db, chat)
+}
+
+func upsertChat(ctx context.Context, exec execContexter, chat domain.ChatSummary) error {
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO chats (jid, title, normalized_title, is_group, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(jid) DO UPDATE SET
@@ -312,6 +347,10 @@ func (s *Store) GetChat(ctx context.Context, jid string) (*domain.ChatSummary, e
 }
 
 func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, incrementUnread bool) error {
+	return s.RecordMessageWithChatTitle(ctx, msg, "", incrementUnread)
+}
+
+func (s *Store) RecordMessageWithChatTitle(ctx context.Context, msg domain.Message, chatTitle string, incrementUnread bool) error {
 	if ignoredChatJID(msg.ChatJID) {
 		return nil
 	}
@@ -325,6 +364,61 @@ func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, increment
 		}
 	}()
 
+	if err := recordMessage(ctx, tx, msg, chatTitle, incrementUnread); err != nil {
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("commit message tx: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordHistoryBatch(ctx context.Context, chat domain.ChatSummary, messages []domain.Message) error {
+	if ignoredChatJID(chat.JID) {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin history batch tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, msg := range messages {
+		if err := recordMessage(ctx, tx, msg, chat.Title, false); err != nil {
+			return err
+		}
+	}
+
+	storedChat, scanErr := scanChatSummary(tx.QueryRowContext(ctx, chatSummarySelect+`WHERE chats.jid = ?`, chat.JID))
+	switch scanErr {
+	case nil:
+		chat.LastMessageID = storedChat.LastMessageID
+		chat.LastMessagePreview = storedChat.LastMessagePreview
+		chat.LastSenderName = storedChat.LastSenderName
+		chat.LastMessageAt = storedChat.LastMessageAt
+	case sql.ErrNoRows:
+	default:
+		return fmt.Errorf("load history chat %s: %w", chat.JID, scanErr)
+	}
+
+	if err := upsertChat(ctx, tx, chat); err != nil {
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("commit history batch tx: %w", err)
+	}
+	return nil
+}
+
+func recordMessage(ctx context.Context, tx *sql.Tx, msg domain.Message, chatTitle string, incrementUnread bool) error {
 	result, err := tx.ExecContext(ctx, `
 	INSERT OR IGNORE INTO messages (
 	    chat_jid, id, sender_jid, sender_name, text_body, ts, from_me, receipt, is_group,
@@ -343,7 +437,7 @@ func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, increment
 		return fmt.Errorf("read message rows affected: %w", err)
 	}
 
-	currentTitle := msg.ChatJID
+	currentTitle := firstNonEmpty(strings.TrimSpace(chatTitle), msg.ChatJID)
 	row := tx.QueryRowContext(ctx, `SELECT title FROM chats WHERE jid = ?`, msg.ChatJID)
 	var existingTitle string
 	switch scanErr := row.Scan(&existingTitle); scanErr {
@@ -356,6 +450,7 @@ func (s *Store) RecordMessage(ctx context.Context, msg domain.Message, increment
 		return fmt.Errorf("load existing chat title %s: %w", msg.ChatJID, scanErr)
 	}
 
+	unread := unreadIncrement(rows, incrementUnread)
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO chats (jid, title, normalized_title, is_group, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -380,14 +475,9 @@ ON CONFLICT(jid) DO UPDATE SET
         ELSE chats.last_message_at
     END,
     unread_count = chats.unread_count + ?
-`, msg.ChatJID, currentTitle, NormalizeSearch(strings.Join([]string{currentTitle, msg.ChatJID}, " ")), boolToInt(msg.IsGroup), msg.ID, previewText(msg.Text), msg.SenderName, timeString(msg.Timestamp), 0, unreadIncrement(rows, incrementUnread))
+`, msg.ChatJID, currentTitle, NormalizeSearch(strings.Join([]string{currentTitle, msg.ChatJID}, " ")), boolToInt(msg.IsGroup), msg.ID, previewText(msg.Text), msg.SenderName, timeString(msg.Timestamp), unread, unread)
 	if err != nil {
 		return fmt.Errorf("upsert message chat %s: %w", msg.ChatJID, err)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("commit message tx: %w", err)
 	}
 	return nil
 }

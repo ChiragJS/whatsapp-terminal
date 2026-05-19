@@ -24,6 +24,7 @@ import (
 
 	"github.com/chirag/whatsapp-terminal/internal/config"
 	"github.com/chirag/whatsapp-terminal/internal/domain"
+	"github.com/chirag/whatsapp-terminal/internal/media"
 	appstore "github.com/chirag/whatsapp-terminal/internal/store"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
@@ -222,18 +223,7 @@ func (a *Adapter) persistSentMessage(ctx context.Context, chatJID types.JID, msg
 		sentAt = time.Now().UTC()
 	}
 	msg.Timestamp = sentAt
-	if err := a.repo.RecordMessage(ctx, msg, false); err != nil {
-		return err
-	}
-	if err := a.repo.UpsertChat(ctx, domain.ChatSummary{
-		JID:                chatJID.String(),
-		Title:              a.resolveChatTitle(ctx, chatJID, ""),
-		LastMessageID:      msg.ID,
-		LastMessagePreview: msg.Text,
-		LastSenderName:     msg.SenderName,
-		LastMessageAt:      msg.Timestamp,
-		IsGroup:            msg.IsGroup,
-	}); err != nil {
+	if err := a.repo.RecordMessageWithChatTitle(ctx, msg, a.resolveChatTitle(ctx, chatJID, ""), false); err != nil {
 		return err
 	}
 	a.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID.String()})
@@ -491,37 +481,19 @@ func (a *Adapter) handleHistorySync(ctx context.Context, sync *waHistorySync.His
 			IsGroup:     canonicalChat.Server == types.GroupServer,
 		}
 
-		var latest *domain.Message
+		messages := make([]domain.Message, 0, len(conversation.GetMessages()))
 		for _, item := range conversation.GetMessages() {
 			msg, ok := a.historyMessageToDomain(ctx, canonicalChat, item)
 			if !ok {
 				continue
 			}
-			if err := a.repo.RecordMessage(ctx, msg, false); err != nil {
-				return err
-			}
-			localCopy := msg
-			if latest == nil || localCopy.Timestamp.After(latest.Timestamp) {
-				latest = &localCopy
-			}
-		}
-
-		if storedChat, err := a.repo.GetChat(ctx, chat.JID); err == nil && storedChat != nil {
-			chat.LastMessageID = storedChat.LastMessageID
-			chat.LastMessagePreview = storedChat.LastMessagePreview
-			chat.LastSenderName = storedChat.LastSenderName
-			chat.LastMessageAt = storedChat.LastMessageAt
-		} else if latest != nil {
-			chat.LastMessageID = latest.ID
-			chat.LastMessagePreview = latest.Text
-			chat.LastSenderName = latest.SenderName
-			chat.LastMessageAt = latest.Timestamp
+			messages = append(messages, msg)
 		}
 		if chat.LastMessageAt.IsZero() && conversation.GetConversationTimestamp() > 0 {
 			chat.LastMessageAt = unixTimeFromUint64(conversation.GetConversationTimestamp())
 		}
 
-		if err := a.repo.UpsertChat(ctx, chat); err != nil {
+		if err := a.repo.RecordHistoryBatch(ctx, chat, messages); err != nil {
 			return err
 		}
 	}
@@ -567,23 +539,7 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 		})
 	}
 
-	if err := a.repo.RecordMessage(ctx, msg, !msg.FromMe); err != nil {
-		return err
-	}
-	unreadCount := 0
-	if current, err := a.repo.GetChat(ctx, msg.ChatJID); err == nil && current != nil {
-		unreadCount = current.UnreadCount
-	}
-	if err := a.repo.UpsertChat(ctx, domain.ChatSummary{
-		JID:                msg.ChatJID,
-		Title:              a.resolveChatTitle(ctx, chatJID, evt.Info.PushName),
-		LastMessageID:      msg.ID,
-		LastMessagePreview: msg.Text,
-		LastSenderName:     msg.SenderName,
-		LastMessageAt:      msg.Timestamp,
-		UnreadCount:        unreadCount,
-		IsGroup:            msg.IsGroup,
-	}); err != nil {
+	if err := a.repo.RecordMessageWithChatTitle(ctx, msg, a.resolveChatTitle(ctx, chatJID, evt.Info.PushName), !msg.FromMe); err != nil {
 		return err
 	}
 
@@ -1258,19 +1214,10 @@ func detectOutgoingMedia(path string) (domain.MediaKind, string, error) {
 		}
 		mimeType = http.DetectContentType(sample)
 	}
-	switch {
-	case strings.HasPrefix(mimeType, "image/"):
-		return domain.MediaKindImage, mimeType, nil
-	case strings.HasPrefix(mimeType, "video/"):
-		return domain.MediaKindVideo, mimeType, nil
-	case strings.HasPrefix(mimeType, "audio/"):
-		return domain.MediaKindAudio, mimeType, nil
-	default:
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
-		}
-		return domain.MediaKindDocument, mimeType, nil
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
 	}
+	return media.KindForMIME(mimeType), mimeType, nil
 }
 
 func mediaUploadType(kind domain.MediaKind) whatsmeow.MediaType {
@@ -1324,7 +1271,7 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 		if cfg.Height > 0 {
 			imageMsg.Height = proto.Uint32(clampIntToUint32(cfg.Height))
 		}
-		return &waE2E.Message{ImageMessage: imageMsg}, mediaPreview(domain.MediaKindImage, base, caption), domain.MediaKindImage, nil
+		return &waE2E.Message{ImageMessage: imageMsg}, media.Preview(domain.MediaKindImage, base, caption), domain.MediaKindImage, nil
 	case domain.MediaKindVideo:
 		videoMsg := &waE2E.VideoMessage{
 			Mimetype:      proto.String(mimeType),
@@ -1336,7 +1283,7 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 			FileSHA256:    upload.FileSHA256,
 			FileLength:    proto.Uint64(upload.FileLength),
 		}
-		return &waE2E.Message{VideoMessage: videoMsg}, mediaPreview(domain.MediaKindVideo, base, caption), domain.MediaKindVideo, nil
+		return &waE2E.Message{VideoMessage: videoMsg}, media.Preview(domain.MediaKindVideo, base, caption), domain.MediaKindVideo, nil
 	case domain.MediaKindVoice:
 		seconds := durationSeconds(duration)
 		audioMsg := &waE2E.AudioMessage{
@@ -1350,7 +1297,7 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 			Seconds:       proto.Uint32(seconds),
 			PTT:           proto.Bool(true),
 		}
-		return &waE2E.Message{AudioMessage: audioMsg}, mediaPreview(domain.MediaKindVoice, base, ""), domain.MediaKindVoice, nil
+		return &waE2E.Message{AudioMessage: audioMsg}, media.Preview(domain.MediaKindVoice, base, ""), domain.MediaKindVoice, nil
 	case domain.MediaKindAudio:
 		audioMsg := &waE2E.AudioMessage{
 			Mimetype:      proto.String(mimeType),
@@ -1362,7 +1309,7 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 			FileLength:    proto.Uint64(upload.FileLength),
 			PTT:           proto.Bool(false),
 		}
-		return &waE2E.Message{AudioMessage: audioMsg}, mediaPreview(domain.MediaKindAudio, base, caption), domain.MediaKindAudio, nil
+		return &waE2E.Message{AudioMessage: audioMsg}, media.Preview(domain.MediaKindAudio, base, caption), domain.MediaKindAudio, nil
 	default:
 		documentMsg := &waE2E.DocumentMessage{
 			Mimetype:      proto.String(mimeType),
@@ -1376,48 +1323,16 @@ func buildOutgoingMediaMessage(path, caption string, kind domain.MediaKind, mime
 			FileSHA256:    upload.FileSHA256,
 			FileLength:    proto.Uint64(upload.FileLength),
 		}
-		return &waE2E.Message{DocumentMessage: documentMsg}, mediaPreview(domain.MediaKindDocument, base, caption), domain.MediaKindDocument, nil
+		return &waE2E.Message{DocumentMessage: documentMsg}, media.Preview(domain.MediaKindDocument, base, caption), domain.MediaKindDocument, nil
 	}
-}
-
-func mediaPreview(kind domain.MediaKind, fileName, caption string) string {
-	label := "[" + string(kind) + "]"
-	if kind == domain.MediaKindVoice {
-		label = "[voice note]"
-	}
-	preview := strings.TrimSpace(label + " " + fileName)
-	if caption != "" {
-		preview += " — " + caption
-	}
-	return preview
 }
 
 func downloadFileName(msg domain.Message) string {
 	name := strings.TrimSpace(msg.MediaFileName)
 	if name == "" {
-		name = msg.ID + mediaExtension(msg.MediaMIME, msg.MediaKind)
+		name = msg.ID + media.Extension(msg.MediaMIME, msg.MediaKind)
 	}
 	return name
-}
-
-func mediaExtension(mimeType string, kind domain.MediaKind) string {
-	if extensions, _ := mime.ExtensionsByType(mimeType); len(extensions) > 0 {
-		return extensions[0]
-	}
-	switch kind {
-	case domain.MediaKindImage:
-		return ".img"
-	case domain.MediaKindVideo:
-		return ".mp4"
-	case domain.MediaKindVoice:
-		return ".ogg"
-	case domain.MediaKindAudio:
-		return ".audio"
-	case domain.MediaKindDocument:
-		return ".bin"
-	default:
-		return ".dat"
-	}
 }
 
 func cloneBytes(input []byte) []byte {

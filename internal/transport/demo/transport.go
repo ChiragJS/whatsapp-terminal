@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/chirag/whatsapp-terminal/internal/domain"
+	"github.com/chirag/whatsapp-terminal/internal/media"
 	appstore "github.com/chirag/whatsapp-terminal/internal/store"
 )
 
@@ -66,24 +67,7 @@ func (t *Transport) SendText(ctx context.Context, chatJID, text string) error {
 		Receipt:    domain.ReceiptStateSent,
 		IsGroup:    chatJID == "project-alpha@g.us",
 	}
-	if err := t.repo.RecordMessage(ctx, msg, false); err != nil {
-		return err
-	}
-
-	title := "Unknown"
-	if chat, err := t.repo.GetChat(ctx, chatJID); err == nil && chat != nil {
-		title = chat.Title
-	}
-	if err := t.repo.UpsertChat(ctx, domain.ChatSummary{
-		JID:                chatJID,
-		Title:              title,
-		LastMessageID:      msg.ID,
-		LastMessagePreview: text,
-		LastSenderName:     "You",
-		LastMessageAt:      now,
-		UnreadCount:        0,
-		IsGroup:            msg.IsGroup,
-	}); err != nil {
+	if err := t.repo.RecordMessageWithChatTitle(ctx, msg, "Unknown", false); err != nil {
 		return err
 	}
 
@@ -97,10 +81,7 @@ func (t *Transport) SendImage(ctx context.Context, chatJID, path, caption string
 }
 
 func (t *Transport) SendMedia(ctx context.Context, chatJID, path, caption string) error {
-	kind, err := detectMediaKind(path)
-	if err != nil {
-		return err
-	}
+	kind := media.KindForMIME(detectMIME(path))
 	return t.recordOutgoingMedia(ctx, chatJID, path, caption, kind, kind, 0)
 }
 
@@ -120,7 +101,7 @@ func (t *Transport) DownloadMedia(ctx context.Context, msg domain.Message, downl
 	}
 	name := msg.MediaFileName
 	if name == "" {
-		name = fmt.Sprintf("%s%s", msg.ID, mediaExtension(msg.MediaMIME, msg.MediaKind))
+		name = fmt.Sprintf("%s%s", msg.ID, media.Extension(msg.MediaMIME, msg.MediaKind))
 	}
 	targetPath := filepath.Join(downloadDir, name)
 	content := []byte("demo media placeholder")
@@ -138,7 +119,7 @@ func (t *Transport) recordOutgoingMedia(ctx context.Context, chatJID, path, capt
 	defer t.mu.Unlock()
 
 	now := time.Now().UTC()
-	preview := mediaPreview(previewKind, path, caption)
+	preview := media.Preview(previewKind, filepath.Base(path), caption)
 	msg := domain.Message{
 		ID:            fmt.Sprintf("demo-media-%d", now.UnixNano()),
 		ChatJID:       chatJID,
@@ -154,28 +135,11 @@ func (t *Transport) recordOutgoingMedia(ctx context.Context, chatJID, path, capt
 		MediaFileName: filepath.Base(path),
 		MediaSeconds:  durationSeconds(duration),
 	}
-	if err := t.repo.RecordMessage(ctx, msg, false); err != nil {
-		return err
-	}
-
-	title := "Unknown"
-	if chat, err := t.repo.GetChat(ctx, chatJID); err == nil && chat != nil {
-		title = chat.Title
-	}
-	if err := t.repo.UpsertChat(ctx, domain.ChatSummary{
-		JID:                chatJID,
-		Title:              title,
-		LastMessageID:      msg.ID,
-		LastMessagePreview: preview,
-		LastSenderName:     "You",
-		LastMessageAt:      now,
-		UnreadCount:        0,
-		IsGroup:            msg.IsGroup,
-	}); err != nil {
+	if err := t.repo.RecordMessageWithChatTitle(ctx, msg, "Unknown", false); err != nil {
 		return err
 	}
 	t.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID})
-	t.emit(domain.Event{Type: domain.EventStatus, Status: fmt.Sprintf("%s sent in demo mode", mediaStatusLabel(previewKind))})
+	t.emit(domain.Event{Type: domain.EventStatus, Status: fmt.Sprintf("%s sent in demo mode", media.StatusLabel(previewKind))})
 	return nil
 }
 
@@ -213,20 +177,6 @@ func (t *Transport) RequestHistory(ctx context.Context, chatJID string, count in
 	return nil
 }
 
-func detectMediaKind(path string) (domain.MediaKind, error) {
-	mimeType := detectMIME(path)
-	switch {
-	case strings.HasPrefix(mimeType, "image/"):
-		return domain.MediaKindImage, nil
-	case strings.HasPrefix(mimeType, "video/"):
-		return domain.MediaKindVideo, nil
-	case strings.HasPrefix(mimeType, "audio/"):
-		return domain.MediaKindAudio, nil
-	default:
-		return domain.MediaKindDocument, nil
-	}
-}
-
 func detectMIME(path string) string {
 	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
 	if mimeType != "" {
@@ -242,52 +192,6 @@ func detectMIME(path string) string {
 	n, _ := file.Read(sample)
 	return http.DetectContentType(sample[:n])
 }
-
-func mediaPreview(kind domain.MediaKind, path, caption string) string {
-	label := "[" + string(kind) + "]"
-	if kind == domain.MediaKindVoice {
-		label = "[voice note]"
-	}
-	preview := label + " " + filepath.Base(path)
-	if strings.TrimSpace(caption) != "" {
-		preview += " — " + strings.TrimSpace(caption)
-	}
-	return preview
-}
-
-func mediaExtension(mimeType string, kind domain.MediaKind) string {
-	if extensions, _ := mime.ExtensionsByType(mimeType); len(extensions) > 0 {
-		return extensions[0]
-	}
-	switch kind {
-	case domain.MediaKindImage:
-		return ".img"
-	case domain.MediaKindVideo:
-		return ".mp4"
-	case domain.MediaKindVoice:
-		return ".ogg"
-	case domain.MediaKindAudio:
-		return ".audio"
-	default:
-		return ".bin"
-	}
-}
-
-func mediaStatusLabel(kind domain.MediaKind) string {
-	switch kind {
-	case domain.MediaKindVoice:
-		return "Voice note"
-	case domain.MediaKindImage:
-		return "Image"
-	case domain.MediaKindVideo:
-		return "Video"
-	case domain.MediaKindAudio:
-		return "Audio"
-	default:
-		return "Media"
-	}
-}
-
 func (t *Transport) seed(ctx context.Context) error {
 	chats, err := t.repo.ListChats(ctx, "", 1)
 	if err != nil {
@@ -351,36 +255,20 @@ func (t *Transport) seed(ctx context.Context) error {
 			IsGroup:    true,
 		},
 	}
-	for _, msg := range messages {
-		if err := t.repo.RecordMessage(ctx, msg, !msg.FromMe); err != nil {
-			return err
-		}
+	if err := t.repo.RecordHistoryBatch(ctx, domain.ChatSummary{
+		JID:         "alice@s.whatsapp.net",
+		Title:       "Alice Mercer",
+		UnreadCount: 0,
+	}, messages[:2]); err != nil {
+		return err
 	}
-
-	chatsToSeed := []domain.ChatSummary{
-		{
-			JID:                "project-alpha@g.us",
-			Title:              "Project Alpha",
-			LastMessageID:      "demo-4",
-			LastMessagePreview: "I’ll review the summary tonight and send comments.",
-			LastSenderName:     "You",
-			LastMessageAt:      base.Add(-8 * time.Minute),
-			UnreadCount:        1,
-			IsGroup:            true,
-		},
-		{
-			JID:                "alice@s.whatsapp.net",
-			Title:              "Alice Mercer",
-			LastMessageID:      "demo-2",
-			LastMessagePreview: "Yes. Let’s do 7:30.",
-			LastSenderName:     "You",
-			LastMessageAt:      base.Add(-22 * time.Minute),
-		},
-	}
-	for _, chat := range chatsToSeed {
-		if err := t.repo.UpsertChat(ctx, chat); err != nil {
-			return err
-		}
+	if err := t.repo.RecordHistoryBatch(ctx, domain.ChatSummary{
+		JID:         "project-alpha@g.us",
+		Title:       "Project Alpha",
+		UnreadCount: 1,
+		IsGroup:     true,
+	}, messages[2:]); err != nil {
+		return err
 	}
 	return nil
 }

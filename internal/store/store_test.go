@@ -268,6 +268,7 @@ func TestGetChatReturnsStoredLastMessageMetadataWithoutCachedMessages(t *testing
 	}
 	if chat == nil {
 		t.Fatal("GetChat() = nil, want chat summary")
+		return
 	}
 	if chat.LastMessageID != "last-msg-1" {
 		t.Fatalf("LastMessageID = %q, want last-msg-1", chat.LastMessageID)
@@ -407,6 +408,56 @@ func TestDirectChatPrefersContactNameOverCachedNumericTitle(t *testing.T) {
 	}
 }
 
+func TestUpsertContactPreservesBestKnownIdentity(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	jid := "15550003333@s.whatsapp.net"
+	if err := repo.UpsertContact(ctx, domain.Contact{
+		JID:         jid,
+		DisplayName: "Asha Rao",
+	}); err != nil {
+		t.Fatalf("UpsertContact(display) error = %v", err)
+	}
+	if err := repo.UpsertContact(ctx, domain.Contact{
+		JID:      jid,
+		PushName: "Rocket",
+	}); err != nil {
+		t.Fatalf("UpsertContact(push) error = %v", err)
+	}
+	if err := repo.UpsertContact(ctx, domain.Contact{
+		JID:         jid,
+		DisplayName: "Asha K.",
+	}); err != nil {
+		t.Fatalf("UpsertContact(display update) error = %v", err)
+	}
+
+	name, err := repo.ContactName(ctx, jid)
+	if err != nil {
+		t.Fatalf("ContactName() error = %v", err)
+	}
+	if name != "Asha K." {
+		t.Fatalf("ContactName() = %q, want Asha K.", name)
+	}
+
+	chats, err := repo.ListChats(ctx, "rocket", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 1 {
+		t.Fatalf("len(chats) = %d, want 1", len(chats))
+	}
+	if chats[0].Title != "Asha K." {
+		t.Fatalf("chats[0].Title = %q, want Asha K.", chats[0].Title)
+	}
+}
+
 func TestListMessagesPrefersContactNameOverStoredSenderNumber(t *testing.T) {
 	t.Parallel()
 
@@ -504,6 +555,114 @@ func TestListChatsUsesLatestStoredMessageMetadata(t *testing.T) {
 	}
 	if !chats[0].LastMessageAt.Equal(time.Date(2026, 4, 5, 11, 0, 0, 0, time.UTC)) {
 		t.Fatalf("LastMessageAt = %s", chats[0].LastMessageAt)
+	}
+}
+
+func TestRecordMessageWithChatTitleOwnsChatSummary(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "project-alpha@g.us"
+	msg := domain.Message{
+		ID:         "m1",
+		ChatJID:    chatJID,
+		SenderJID:  "bob@s.whatsapp.net",
+		SenderName: "Bob",
+		Text:       "ship the numbers",
+		Timestamp:  time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+		Receipt:    domain.ReceiptStateReceived,
+		IsGroup:    true,
+	}
+	if err := repo.RecordMessageWithChatTitle(ctx, msg, "Project Alpha", true); err != nil {
+		t.Fatalf("RecordMessageWithChatTitle() error = %v", err)
+	}
+	if err := repo.RecordMessageWithChatTitle(ctx, msg, "Ignored Rename", true); err != nil {
+		t.Fatalf("RecordMessageWithChatTitle(duplicate) error = %v", err)
+	}
+
+	chat, err := repo.GetChat(ctx, chatJID)
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat == nil {
+		t.Fatal("GetChat() = nil, want chat summary")
+		return
+	}
+	if chat.Title != "Project Alpha" {
+		t.Fatalf("Title = %q, want Project Alpha", chat.Title)
+	}
+	if chat.LastMessageID != "m1" || chat.LastMessagePreview != "ship the numbers" || chat.LastSenderName != "Bob" {
+		t.Fatalf("chat latest fields = %#v", chat)
+	}
+	if chat.UnreadCount != 1 {
+		t.Fatalf("UnreadCount = %d, want duplicate message to keep unread at 1", chat.UnreadCount)
+	}
+}
+
+func TestRecordHistoryBatchOwnsChatSummary(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	chatJID := "project-alpha@g.us"
+	messages := []domain.Message{
+		{
+			ID:         "history-1",
+			ChatJID:    chatJID,
+			SenderJID:  "alice@s.whatsapp.net",
+			SenderName: "Alice",
+			Text:       "older",
+			Timestamp:  time.Date(2026, 4, 5, 9, 0, 0, 0, time.UTC),
+			Receipt:    domain.ReceiptStateReceived,
+			IsGroup:    true,
+		},
+		{
+			ID:         "history-2",
+			ChatJID:    chatJID,
+			SenderJID:  "bob@s.whatsapp.net",
+			SenderName: "Bob",
+			Text:       "newer",
+			Timestamp:  time.Date(2026, 4, 5, 9, 5, 0, 0, time.UTC),
+			Receipt:    domain.ReceiptStateReceived,
+			IsGroup:    true,
+		},
+	}
+	if err := repo.RecordHistoryBatch(ctx, domain.ChatSummary{
+		JID:         chatJID,
+		Title:       "Project Alpha",
+		UnreadCount: 7,
+		IsGroup:     true,
+	}, messages); err != nil {
+		t.Fatalf("RecordHistoryBatch() error = %v", err)
+	}
+
+	chat, err := repo.GetChat(ctx, chatJID)
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat == nil {
+		t.Fatal("GetChat() = nil, want chat summary")
+		return
+	}
+	if chat.Title != "Project Alpha" {
+		t.Fatalf("Title = %q, want Project Alpha", chat.Title)
+	}
+	if chat.UnreadCount != 7 {
+		t.Fatalf("UnreadCount = %d, want history metadata to set 7", chat.UnreadCount)
+	}
+	if chat.LastMessageID != "history-2" || chat.LastMessagePreview != "newer" || chat.LastSenderName != "Bob" {
+		t.Fatalf("chat latest fields = %#v", chat)
 	}
 }
 

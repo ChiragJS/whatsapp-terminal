@@ -1,6 +1,7 @@
 package whatsapp
 
 import (
+	"fmt"
 	"log/slog"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -37,4 +38,11 @@ func (b *bridgeLogger) Debugf(msg string, args ...interface{}) {
 
 func (b *bridgeLogger) Sub(module string) waLog.Logger {
 	return &bridgeLogger{logger: b.logger.With("wa_module", module)}
+}
+
+func formatf(msg string, args ...interface{}) string {
+	if len(args) == 0 {
+		return msg
+	}
+	return fmt.Sprintf(msg, args...)
 }
