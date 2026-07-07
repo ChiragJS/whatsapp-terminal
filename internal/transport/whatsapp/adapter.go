@@ -130,7 +130,7 @@ func (a *Adapter) SendText(ctx context.Context, chatJID, text string) error {
 	if err != nil {
 		return fmt.Errorf("parse chat JID: %w", err)
 	}
-	canonicalChat, err := a.normalizeDirectChatJID(ctx, jid)
+	canonicalChat, err := a.canonicalUserJID(ctx, jid)
 	if err != nil {
 		return err
 	}
@@ -320,7 +320,7 @@ func (a *Adapter) sendUploadedMedia(ctx context.Context, chatJID, path, caption 
 	if err != nil {
 		return fmt.Errorf("parse chat JID: %w", err)
 	}
-	canonicalChat, err := a.normalizeDirectChatJID(ctx, jid)
+	canonicalChat, err := a.canonicalUserJID(ctx, jid)
 	if err != nil {
 		return err
 	}
@@ -498,7 +498,7 @@ func (a *Adapter) handleHistorySync(ctx context.Context, sync *waHistorySync.His
 			continue
 		}
 
-		canonicalChat, err := a.normalizeDirectChatJID(ctx, chatJID)
+		canonicalChat, err := a.canonicalUserJID(ctx, chatJID)
 		if err != nil {
 			return err
 		}
@@ -537,18 +537,24 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 		return nil
 	}
 
-	chatJID, err := a.normalizeDirectChatJID(ctx, evt.Info.Chat.ToNonAD())
+	chatJID, err := a.canonicalUserJID(ctx, evt.Info.Chat.ToNonAD())
 	if err != nil {
 		return err
 	}
 	if ignoredChatJID(chatJID.String()) {
 		return nil
 	}
+	// Store senders under their phone-number JID so saved contact names
+	// resolve even when the message arrived under the sender's LID alias.
+	sender, err := a.canonicalUserJID(ctx, evt.Info.Sender.ToNonAD())
+	if err != nil {
+		sender = evt.Info.Sender.ToNonAD()
+	}
 	msg := domain.Message{
 		ID:         evt.Info.ID,
 		ChatJID:    chatJID.String(),
-		SenderJID:  evt.Info.Sender.ToNonAD().String(),
-		SenderName: a.resolveSenderName(ctx, evt.Info.Sender.ToNonAD(), evt.Info.PushName),
+		SenderJID:  sender.String(),
+		SenderName: a.resolveSenderName(ctx, sender, evt.Info.PushName),
 		Text:       extractText(evt.Message),
 		Timestamp:  evt.Info.Timestamp.UTC(),
 		FromMe:     evt.Info.IsFromMe,
@@ -563,7 +569,7 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 
 	if !evt.Info.IsGroup && evt.Info.PushName != "" {
 		_ = a.repo.UpsertContact(ctx, domain.Contact{
-			JID:      evt.Info.Sender.ToNonAD().String(),
+			JID:      sender.String(),
 			PushName: evt.Info.PushName,
 		})
 	}
@@ -622,11 +628,82 @@ func (a *Adapter) syncContacts(ctx context.Context) error {
 			}
 		}
 	}
+	if err := a.mirrorLIDAliases(ctx); err != nil {
+		if !isSQLiteBusy(err) {
+			return err
+		}
+	}
 	if err := a.syncRecentChatContacts(ctx); err != nil {
 		if isSQLiteBusy(err) {
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+// mirrorLIDAliases copies contact names across WhatsApp's LID/phone-number
+// JID aliases. Saved address-book names land on the @s.whatsapp.net JID,
+// while group messages often carry the sender's hidden @lid JID; without the
+// mirror those messages resolve to push names instead of the saved name.
+func (a *Adapter) mirrorLIDAliases(ctx context.Context) error {
+	a.mu.RLock()
+	db := a.sessionDB
+	a.mu.RUnlock()
+	if db == nil {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT lid, pn FROM whatsmeow_lid_map`)
+	if err != nil {
+		return fmt.Errorf("query lid mappings for contact mirror: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var lidUser, pnUser string
+		if err := rows.Scan(&lidUser, &pnUser); err != nil {
+			return fmt.Errorf("scan lid mapping for contact mirror: %w", err)
+		}
+		if err := a.mirrorContactPair(ctx, pnUser+"@s.whatsapp.net", lidUser+"@lid"); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// mirrorContactPair merges the contact rows stored under a phone-number JID
+// and its LID alias, preferring the phone-number side per field, and writes
+// the merged names back to whichever alias is missing them.
+func (a *Adapter) mirrorContactPair(ctx context.Context, pnJID, lidJID string) error {
+	pn, _, err := a.repo.ContactByJID(ctx, pnJID)
+	if err != nil {
+		return err
+	}
+	lid, _, err := a.repo.ContactByJID(ctx, lidJID)
+	if err != nil {
+		return err
+	}
+	merged := domain.Contact{
+		DisplayName:  firstNonEmpty(pn.DisplayName, lid.DisplayName),
+		PushName:     firstNonEmpty(pn.PushName, lid.PushName),
+		BusinessName: firstNonEmpty(pn.BusinessName, lid.BusinessName),
+	}
+	if merged == (domain.Contact{}) {
+		return nil
+	}
+	targets := []struct {
+		jid      string
+		existing domain.Contact
+	}{{pnJID, pn}, {lidJID, lid}}
+	for _, target := range targets {
+		if target.existing.DisplayName == merged.DisplayName &&
+			target.existing.PushName == merged.PushName &&
+			target.existing.BusinessName == merged.BusinessName {
+			continue
+		}
+		merged.JID = target.jid
+		if err := a.repo.UpsertContact(ctx, merged); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -738,13 +815,16 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 	client := a.clientRef()
 	if client != nil {
 		if parsed, err := client.ParseWebMessage(chatJID, webMsg); err == nil && parsed != nil {
+			sender, err := a.canonicalUserJID(ctx, parsed.Info.Sender.ToNonAD())
+			if err != nil {
+				sender = parsed.Info.Sender.ToNonAD()
+			}
 			if !parsed.Info.IsFromMe && parsed.Info.PushName != "" {
 				_ = a.repo.UpsertContact(ctx, domain.Contact{
-					JID:      parsed.Info.Sender.ToNonAD().String(),
+					JID:      sender.String(),
 					PushName: parsed.Info.PushName,
 				})
 			}
-			sender := parsed.Info.Sender.ToNonAD()
 			msg := domain.Message{
 				ID:         parsed.Info.ID,
 				ChatJID:    parsed.Info.Chat.ToNonAD().String(),
@@ -773,6 +853,9 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 		sender, _ = types.ParseJID(key.GetParticipant())
 	default:
 		sender = chatJID
+	}
+	if canonical, err := a.canonicalUserJID(ctx, sender.ToNonAD()); err == nil {
+		sender = canonical
 	}
 	msg := domain.Message{
 		ID:         key.GetID(),
@@ -1060,7 +1143,11 @@ func (a *Adapter) normalizeDirectChats(ctx context.Context) error {
 	return nil
 }
 
-func (a *Adapter) normalizeDirectChatJID(ctx context.Context, jid types.JID) (types.JID, error) {
+// canonicalUserJID maps a hidden-LID user JID (…@lid) to its phone-number
+// JID (…@s.whatsapp.net) via the session's lid map. Non-LID JIDs pass
+// through unchanged. Used for both chat and sender JIDs so every message is
+// stored under the alias that carries the saved contact name.
+func (a *Adapter) canonicalUserJID(ctx context.Context, jid types.JID) (types.JID, error) {
 	jid = jid.ToNonAD()
 	if jid.Server != types.HiddenUserServer {
 		return jid, nil

@@ -267,6 +267,22 @@ ON CONFLICT(jid) DO UPDATE SET
 	return nil
 }
 
+// ContactByJID returns the stored contact row for jid; the bool reports
+// whether a row exists.
+func (s *Store) ContactByJID(ctx context.Context, jid string) (domain.Contact, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT jid, display_name, push_name, business_name FROM contacts WHERE jid = ?
+`, jid)
+	var contact domain.Contact
+	if err := row.Scan(&contact.JID, &contact.DisplayName, &contact.PushName, &contact.BusinessName); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.Contact{}, false, nil
+		}
+		return domain.Contact{}, false, fmt.Errorf("load contact %s: %w", jid, err)
+	}
+	return contact, true, nil
+}
+
 func (s *Store) ContactName(ctx context.Context, jid string) (string, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT display_name, push_name, business_name FROM contacts WHERE jid = ?
