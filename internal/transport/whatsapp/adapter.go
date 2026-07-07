@@ -424,8 +424,12 @@ func (a *Adapter) handleEvent(raw any) {
 	case *waevents.PushName:
 		ctx, cancel := a.contextWithTimeout(20 * time.Second)
 		defer cancel()
+		jid, err := a.canonicalUserJID(ctx, evt.JID)
+		if err != nil {
+			jid = evt.JID.ToNonAD()
+		}
 		_ = a.repo.UpsertContact(ctx, domain.Contact{
-			JID:      evt.JID.ToNonAD().String(),
+			JID:      jid.String(),
 			PushName: evt.NewPushName,
 		})
 		a.emit(domain.Event{Type: domain.EventChatListUpdate})
@@ -480,6 +484,9 @@ func (a *Adapter) handleHistorySync(ctx context.Context, sync *waHistorySync.His
 		jid, err := types.ParseJID(pushName.GetID())
 		if err != nil {
 			continue
+		}
+		if canonical, err := a.canonicalUserJID(ctx, jid); err == nil {
+			jid = canonical
 		}
 		if err := a.repo.UpsertContact(ctx, domain.Contact{
 			JID:      jid.ToNonAD().String(),
@@ -603,10 +610,16 @@ func (a *Adapter) handleReceipt(ctx context.Context, evt *waevents.Receipt) erro
 	if state == domain.ReceiptStateUnknown {
 		return nil
 	}
-	if err := a.repo.UpdateReceipts(ctx, evt.Chat.ToNonAD().String(), evt.MessageIDs, state); err != nil {
+	// Receipts can arrive under the chat's LID alias while its messages are
+	// stored under the phone-number JID; canonicalize or the update misses.
+	chat, err := a.canonicalUserJID(ctx, evt.Chat)
+	if err != nil {
+		chat = evt.Chat.ToNonAD()
+	}
+	if err := a.repo.UpdateReceipts(ctx, chat.String(), evt.MessageIDs, state); err != nil {
 		return err
 	}
-	a.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: evt.Chat.ToNonAD().String()})
+	a.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chat.String()})
 	return nil
 }
 
@@ -826,8 +839,11 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 				})
 			}
 			msg := domain.Message{
-				ID:         parsed.Info.ID,
-				ChatJID:    parsed.Info.Chat.ToNonAD().String(),
+				ID: parsed.Info.ID,
+				// Use the canonical chat JID handed in by handleHistorySync,
+				// not parsed.Info.Chat: the parsed value can be the LID
+				// alias, which would split the conversation across two rows.
+				ChatJID:    chatJID.String(),
 				SenderJID:  sender.String(),
 				SenderName: a.resolveSenderName(ctx, sender, parsed.Info.PushName),
 				Text:       extractText(parsed.Message),
@@ -860,8 +876,8 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 	msg := domain.Message{
 		ID:         key.GetID(),
 		ChatJID:    chatJID.String(),
-		SenderJID:  sender.ToNonAD().String(),
-		SenderName: a.resolveSenderName(ctx, sender.ToNonAD(), ""),
+		SenderJID:  sender.String(),
+		SenderName: a.resolveSenderName(ctx, sender, ""),
 		Text:       extractText(message),
 		Timestamp:  unixTimeFromUint64(webMsg.GetMessageTimestamp()),
 		FromMe:     key.GetFromMe(),

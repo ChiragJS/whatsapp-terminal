@@ -12,6 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"go.mau.fi/whatsmeow/types"
+	waevents "go.mau.fi/whatsmeow/types/events"
 )
 
 func TestResolveChatTitleDoesNotReturnUnknownGroupJID(t *testing.T) {
@@ -177,5 +178,52 @@ func TestCachedLIDSenderResolvesToSavedNameAfterMirror(t *testing.T) {
 	}
 	if len(messages) != 1 || messages[0].SenderName != "Mom" {
 		t.Fatalf("messages = %#v, want sender resolved to Mom", messages)
+	}
+}
+
+func TestHandleReceiptResolvesLIDChatAlias(t *testing.T) {
+	t.Parallel()
+
+	repo, err := appstore.New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+
+	// Sent message stored under the canonical phone-number chat.
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:        "m1",
+		ChatJID:   "911111@s.whatsapp.net",
+		SenderJID: "self@s.whatsapp.net",
+		Text:      "hi",
+		Timestamp: time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC),
+		FromMe:    true,
+		Receipt:   domain.ReceiptStateSent,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+
+	adapter := &Adapter{
+		repo:      repo,
+		events:    make(chan domain.Event, 8),
+		sessionDB: newFakeSessionDB(t, map[string]string{"222lid": "911111"}),
+	}
+	// The read receipt arrives under the chat's LID alias.
+	evt := &waevents.Receipt{
+		MessageSource: types.MessageSource{Chat: types.NewJID("222lid", types.HiddenUserServer)},
+		MessageIDs:    []types.MessageID{"m1"},
+		Type:          types.ReceiptTypeRead,
+	}
+	if err := adapter.handleReceipt(ctx, evt); err != nil {
+		t.Fatalf("handleReceipt() error = %v", err)
+	}
+
+	messages, err := repo.ListMessages(ctx, "911111@s.whatsapp.net", 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 1 || messages[0].Receipt != domain.ReceiptStateRead {
+		t.Fatalf("messages = %#v, want receipt marked read via LID alias", messages)
 	}
 }
