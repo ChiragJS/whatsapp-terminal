@@ -235,62 +235,71 @@ func (a *Adapter) RequestHistory(ctx context.Context, chatJID string, count int)
 	if client == nil {
 		return errors.New("client is not ready")
 	}
-	oldest, err := a.repo.OldestMessage(ctx, chatJID)
-	if err != nil {
-		return err
-	}
 	chat, err := types.ParseJID(chatJID)
 	if err != nil {
 		return fmt.Errorf("parse chat JID: %w", err)
 	}
-	if oldest == nil {
-		summary, err := a.repo.GetChat(ctx, chatJID)
-		if err != nil {
-			return err
-		}
-		if summary != nil && summary.LastMessageID != "" && !summary.LastMessageAt.IsZero() {
-			info := &types.MessageInfo{
-				MessageSource: types.MessageSource{
-					Chat:     chat,
-					IsFromMe: strings.EqualFold(summary.LastSenderName, "You"),
-					IsGroup:  summary.IsGroup,
-				},
-				ID:        summary.LastMessageID,
-				Timestamp: summary.LastMessageAt,
-			}
-			_, err = client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, count))
-			if err != nil {
-				return fmt.Errorf("request chat history sync: %w", err)
-			}
-			a.emit(domain.Event{Type: domain.EventStatus, Status: "Requested chat history from the primary device"})
-			return nil
-		}
+	anchor, status, err := a.historySyncAnchor(ctx, chat, chatJID)
+	if err != nil {
+		return err
+	}
+	if anchor == nil {
+		// Nothing cached to page back from; ask the phone for recent chats.
 		if err := a.requestRecentHistorySync(ctx, 30, clampIntToUint32(max(count, 12))); err != nil {
 			return fmt.Errorf("request recent history sync: %w", err)
 		}
 		a.emit(domain.Event{Type: domain.EventStatus, Status: "Requested recent chats from the primary device"})
 		return nil
 	}
-	sender, err := types.ParseJID(oldest.SenderJID)
-	if err != nil {
-		return fmt.Errorf("parse sender JID: %w", err)
-	}
-	info := &types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     chat,
-			Sender:   sender,
-			IsFromMe: oldest.FromMe,
-			IsGroup:  oldest.IsGroup,
-		},
-		ID:        oldest.ID,
-		Timestamp: oldest.Timestamp,
-	}
-	_, err = client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, count))
-	if err != nil {
+	if _, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(anchor, count)); err != nil {
 		return fmt.Errorf("request history sync: %w", err)
 	}
-	a.emit(domain.Event{Type: domain.EventStatus, Status: "Requested older history from the primary device"})
+	a.emit(domain.Event{Type: domain.EventStatus, Status: status})
 	return nil
+}
+
+// historySyncAnchor picks the message a history request should page back
+// from: the oldest cached message when one exists, else the chat's last known
+// message. A nil anchor means the cache holds nothing usable.
+func (a *Adapter) historySyncAnchor(ctx context.Context, chat types.JID, chatJID string) (*types.MessageInfo, string, error) {
+	oldest, err := a.repo.OldestMessage(ctx, chatJID)
+	if err != nil {
+		return nil, "", err
+	}
+	if oldest != nil {
+		sender, err := types.ParseJID(oldest.SenderJID)
+		if err != nil {
+			return nil, "", fmt.Errorf("parse sender JID: %w", err)
+		}
+		anchor := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: oldest.FromMe,
+				IsGroup:  oldest.IsGroup,
+			},
+			ID:        oldest.ID,
+			Timestamp: oldest.Timestamp,
+		}
+		return anchor, "Requested older history from the primary device", nil
+	}
+	summary, err := a.repo.GetChat(ctx, chatJID)
+	if err != nil {
+		return nil, "", err
+	}
+	if summary == nil || summary.LastMessageID == "" || summary.LastMessageAt.IsZero() {
+		return nil, "", nil
+	}
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: strings.EqualFold(summary.LastSenderName, "You"),
+			IsGroup:  summary.IsGroup,
+		},
+		ID:        summary.LastMessageID,
+		Timestamp: summary.LastMessageAt,
+	}
+	return anchor, "Requested chat history from the primary device", nil
 }
 
 func (a *Adapter) sendUploadedMedia(ctx context.Context, chatJID, path, caption string, kind domain.MediaKind, mimeType string, duration time.Duration) error {
@@ -396,6 +405,9 @@ func (a *Adapter) handleEvent(raw any) {
 		if err := a.syncContacts(ctx); err != nil {
 			a.emit(domain.Event{Type: domain.EventError, Err: err})
 		}
+		if err := a.syncGroupTitles(ctx); err != nil {
+			a.emit(domain.Event{Type: domain.EventError, Err: err})
+		}
 		a.emit(domain.Event{Type: domain.EventChatListUpdate})
 		a.scheduleSessionContactSync()
 		go a.bootstrapRecentHistory()
@@ -421,6 +433,23 @@ func (a *Adapter) handleEvent(raw any) {
 		ctx, cancel := a.contextWithTimeout(30 * time.Second)
 		defer cancel()
 		_ = a.syncContacts(ctx)
+		a.emit(domain.Event{Type: domain.EventChatListUpdate})
+	case *waevents.JoinedGroup:
+		ctx, cancel := a.contextWithTimeout(20 * time.Second)
+		defer cancel()
+		if err := a.recordGroupTitle(ctx, evt.GroupInfo.JID, evt.GroupInfo.GroupName.Name); err != nil {
+			a.emit(domain.Event{Type: domain.EventError, Err: err})
+		}
+		a.emit(domain.Event{Type: domain.EventChatListUpdate})
+	case *waevents.GroupInfo:
+		if evt.Name == nil {
+			return
+		}
+		ctx, cancel := a.contextWithTimeout(20 * time.Second)
+		defer cancel()
+		if err := a.recordGroupTitle(ctx, evt.JID, evt.Name.Name); err != nil {
+			a.emit(domain.Event{Type: domain.EventError, Err: err})
+		}
 		a.emit(domain.Event{Type: domain.EventChatListUpdate})
 	case *waevents.HistorySync:
 		ctx, cancel := a.contextWithTimeout(2 * time.Minute)
@@ -539,7 +568,11 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 		})
 	}
 
-	if err := a.repo.RecordMessageWithChatTitle(ctx, msg, a.resolveChatTitle(ctx, chatJID, evt.Info.PushName), !msg.FromMe); err != nil {
+	chatTitleFallback := ""
+	if !evt.Info.IsGroup {
+		chatTitleFallback = evt.Info.PushName
+	}
+	if err := a.repo.RecordMessageWithChatTitle(ctx, msg, a.resolveChatTitle(ctx, chatJID, chatTitleFallback), !msg.FromMe); err != nil {
 		return err
 	}
 
@@ -596,6 +629,38 @@ func (a *Adapter) syncContacts(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (a *Adapter) syncGroupTitles(ctx context.Context) error {
+	client := a.clientRef()
+	if client == nil {
+		return nil
+	}
+	groups, err := client.GetJoinedGroups(ctx)
+	if err != nil {
+		return fmt.Errorf("sync group titles: %w", err)
+	}
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		if err := a.recordGroupTitle(ctx, group.JID, group.GroupName.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *Adapter) recordGroupTitle(ctx context.Context, jid types.JID, title string) error {
+	jid = jid.ToNonAD()
+	if jid.IsEmpty() || jid.Server != types.GroupServer {
+		return nil
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || title == jid.String() {
+		return nil
+	}
+	return a.repo.UpdateChatTitle(ctx, jid.String(), title, true)
 }
 
 func (a *Adapter) scheduleSessionContactSync() {
@@ -1056,21 +1121,28 @@ func (a *Adapter) selfJID() types.JID {
 }
 
 func (a *Adapter) resolveChatTitle(ctx context.Context, chatJID types.JID, fallback string) string {
-	if existing, err := a.repo.GetChat(ctx, chatJID.String()); err == nil && existing != nil && strings.TrimSpace(existing.Title) != "" {
-		return existing.Title
+	if existing, err := a.repo.GetChat(ctx, chatJID.String()); err == nil && existing != nil {
+		if title := cleanResolvedChatTitle(chatJID, existing.Title); title != "" {
+			return title
+		}
 	}
 	if chatJID.Server != types.GroupServer {
 		if name, err := a.repo.ContactName(ctx, chatJID.String()); err == nil && name != "" {
 			return name
 		}
 	}
-	if strings.TrimSpace(fallback) != "" {
-		return strings.TrimSpace(fallback)
+	if title := cleanResolvedChatTitle(chatJID, fallback); title != "" {
+		return title
 	}
-	if chatJID.User != "" {
-		return chatJID.User
+	return ""
+}
+
+func cleanResolvedChatTitle(chatJID types.JID, title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" || title == chatJID.String() || title == chatJID.User {
+		return ""
 	}
-	return chatJID.String()
+	return title
 }
 
 func (a *Adapter) resolveSenderName(ctx context.Context, sender types.JID, fallback string) string {
@@ -1128,9 +1200,6 @@ func extractText(message *waE2E.Message) string {
 		if message.GetAudioMessage().GetPTT() {
 			return "[voice note]"
 		}
-		if name := strings.TrimSpace(message.GetAudioMessage().GetMimetype()); name != "" {
-			return "[audio]"
-		}
 		return "[audio]"
 	case message.GetReactionMessage() != nil:
 		return "[reaction]"
@@ -1139,61 +1208,49 @@ func extractText(message *waE2E.Message) string {
 	}
 }
 
+// mediaFields is the getter set shared by every waE2E media payload
+// (image, video, document, audio, sticker).
+type mediaFields interface {
+	GetMimetype() string
+	GetDirectPath() string
+	GetFileLength() uint64
+	GetMediaKey() []byte
+	GetFileSHA256() []byte
+	GetFileEncSHA256() []byte
+}
+
+func setMediaFields(msg *domain.Message, kind domain.MediaKind, fields mediaFields) {
+	msg.MediaKind = kind
+	msg.MediaMIME = fields.GetMimetype()
+	msg.MediaDirectPath = fields.GetDirectPath()
+	msg.MediaFileLength = fields.GetFileLength()
+	msg.MediaKey = cloneBytes(fields.GetMediaKey())
+	msg.MediaFileSHA256 = cloneBytes(fields.GetFileSHA256())
+	msg.MediaFileEncSHA256 = cloneBytes(fields.GetFileEncSHA256())
+}
+
 func applyMediaMetadata(msg *domain.Message, message *waE2E.Message) {
 	if msg == nil || message == nil {
 		return
 	}
 	switch {
 	case message.GetImageMessage() != nil:
-		imageMsg := message.GetImageMessage()
-		msg.MediaKind = domain.MediaKindImage
-		msg.MediaMIME = imageMsg.GetMimetype()
-		msg.MediaDirectPath = imageMsg.GetDirectPath()
-		msg.MediaFileLength = imageMsg.GetFileLength()
-		msg.MediaKey = cloneBytes(imageMsg.GetMediaKey())
-		msg.MediaFileSHA256 = cloneBytes(imageMsg.GetFileSHA256())
-		msg.MediaFileEncSHA256 = cloneBytes(imageMsg.GetFileEncSHA256())
+		setMediaFields(msg, domain.MediaKindImage, message.GetImageMessage())
 	case message.GetVideoMessage() != nil:
-		videoMsg := message.GetVideoMessage()
-		msg.MediaKind = domain.MediaKindVideo
-		msg.MediaMIME = videoMsg.GetMimetype()
-		msg.MediaDirectPath = videoMsg.GetDirectPath()
-		msg.MediaFileLength = videoMsg.GetFileLength()
-		msg.MediaKey = cloneBytes(videoMsg.GetMediaKey())
-		msg.MediaFileSHA256 = cloneBytes(videoMsg.GetFileSHA256())
-		msg.MediaFileEncSHA256 = cloneBytes(videoMsg.GetFileEncSHA256())
+		setMediaFields(msg, domain.MediaKindVideo, message.GetVideoMessage())
 	case message.GetDocumentMessage() != nil:
-		docMsg := message.GetDocumentMessage()
-		msg.MediaKind = domain.MediaKindDocument
-		msg.MediaMIME = docMsg.GetMimetype()
-		msg.MediaFileName = docMsg.GetFileName()
-		msg.MediaDirectPath = docMsg.GetDirectPath()
-		msg.MediaFileLength = docMsg.GetFileLength()
-		msg.MediaKey = cloneBytes(docMsg.GetMediaKey())
-		msg.MediaFileSHA256 = cloneBytes(docMsg.GetFileSHA256())
-		msg.MediaFileEncSHA256 = cloneBytes(docMsg.GetFileEncSHA256())
+		setMediaFields(msg, domain.MediaKindDocument, message.GetDocumentMessage())
+		msg.MediaFileName = message.GetDocumentMessage().GetFileName()
 	case message.GetAudioMessage() != nil:
 		audioMsg := message.GetAudioMessage()
-		msg.MediaKind = domain.MediaKindAudio
+		kind := domain.MediaKindAudio
 		if audioMsg.GetPTT() {
-			msg.MediaKind = domain.MediaKindVoice
+			kind = domain.MediaKindVoice
 		}
-		msg.MediaMIME = audioMsg.GetMimetype()
-		msg.MediaDirectPath = audioMsg.GetDirectPath()
-		msg.MediaFileLength = audioMsg.GetFileLength()
+		setMediaFields(msg, kind, audioMsg)
 		msg.MediaSeconds = audioMsg.GetSeconds()
-		msg.MediaKey = cloneBytes(audioMsg.GetMediaKey())
-		msg.MediaFileSHA256 = cloneBytes(audioMsg.GetFileSHA256())
-		msg.MediaFileEncSHA256 = cloneBytes(audioMsg.GetFileEncSHA256())
 	case message.GetStickerMessage() != nil:
-		stickerMsg := message.GetStickerMessage()
-		msg.MediaKind = domain.MediaKindSticker
-		msg.MediaMIME = stickerMsg.GetMimetype()
-		msg.MediaDirectPath = stickerMsg.GetDirectPath()
-		msg.MediaFileLength = stickerMsg.GetFileLength()
-		msg.MediaKey = cloneBytes(stickerMsg.GetMediaKey())
-		msg.MediaFileSHA256 = cloneBytes(stickerMsg.GetFileSHA256())
-		msg.MediaFileEncSHA256 = cloneBytes(stickerMsg.GetFileEncSHA256())
+		setMediaFields(msg, domain.MediaKindSticker, message.GetStickerMessage())
 	}
 }
 

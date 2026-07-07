@@ -36,7 +36,7 @@ SELECT
         WHEN contacts.display_name <> '' THEN contacts.display_name
         WHEN contacts.push_name <> '' THEN contacts.push_name
         WHEN contacts.business_name <> '' THEN contacts.business_name
-        ELSE chats.jid
+        ELSE ''
     END AS title,
     COALESCE((
         SELECT id FROM messages
@@ -156,63 +156,57 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
 	if err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
-	if err := s.ensureColumn(ctx, "messages", "media_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
+	// Columns added after the first release; ensureColumn upgrades caches
+	// created by older builds in place.
+	laterColumns := []struct{ name, definition string }{
+		{"media_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"media_mime", "TEXT NOT NULL DEFAULT ''"},
+		{"media_file_name", "TEXT NOT NULL DEFAULT ''"},
+		{"media_direct_path", "TEXT NOT NULL DEFAULT ''"},
+		{"media_file_length", "INTEGER NOT NULL DEFAULT 0"},
+		{"media_seconds", "INTEGER NOT NULL DEFAULT 0"},
+		{"media_key", "BLOB"},
+		{"media_file_sha256", "BLOB"},
+		{"media_file_enc_sha256", "BLOB"},
+		{"downloaded_path", "TEXT NOT NULL DEFAULT ''"},
 	}
-	if err := s.ensureColumn(ctx, "messages", "media_mime", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
+	for _, column := range laterColumns {
+		if err := s.ensureColumn(ctx, "messages", column.name, column.definition); err != nil {
+			return err
+		}
 	}
-	if err := s.ensureColumn(ctx, "messages", "media_file_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_direct_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_file_length", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_seconds", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_key", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_file_sha256", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "media_file_enc_sha256", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn(ctx, "messages", "downloaded_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
+	return s.clearJIDTitles(ctx)
+}
+
+// clearJIDTitles scrubs chat rows whose title was poisoned with the raw JID
+// or bare JID user part by an older version of recordMessage. Clearing the title (and its
+// search-normalized form) lets resolveChatTitle replace it with a real name
+// on the next sync. Idempotent: rows that are already clean are skipped via
+// the WHERE clause.
+func (s *Store) clearJIDTitles(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE chats SET title = '', normalized_title = ''
+WHERE title <> '' AND (
+    title = jid OR
+    (instr(jid, '@') > 0 AND title = substr(jid, 1, instr(jid, '@') - 1))
+)
+`); err != nil {
+		return fmt.Errorf("clear JID-shaped chat titles: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column,
+	).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("inspect %s schema: %w", table, err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull int
-		var defaultValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
-			return fmt.Errorf("scan %s schema: %w", table, err)
-		}
-		if name == column {
-			return nil
-		}
+	if count > 0 {
+		return nil
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate %s schema: %w", table, err)
-	}
-
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
 		return fmt.Errorf("add %s.%s column: %w", table, column, err)
 	}
@@ -231,9 +225,9 @@ func (s *Store) UpsertContact(ctx context.Context, contact domain.Contact) error
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	contact.DisplayName = firstNonEmpty(contact.DisplayName)
-	contact.PushName = firstNonEmpty(contact.PushName)
-	contact.BusinessName = firstNonEmpty(contact.BusinessName)
+	contact.DisplayName = strings.TrimSpace(contact.DisplayName)
+	contact.PushName = strings.TrimSpace(contact.PushName)
+	contact.BusinessName = strings.TrimSpace(contact.BusinessName)
 
 	row := tx.QueryRowContext(ctx, `
 SELECT display_name, push_name, business_name FROM contacts WHERE jid = ?
@@ -300,6 +294,7 @@ func (s *Store) UpsertChat(ctx context.Context, chat domain.ChatSummary) error {
 }
 
 func upsertChat(ctx context.Context, exec execContexter, chat domain.ChatSummary) error {
+	title := cleanChatTitle(chat.JID, chat.Title)
 	_, err := exec.ExecContext(ctx, `
 INSERT INTO chats (jid, title, normalized_title, is_group, last_message_id, last_message_preview, last_sender_name, last_message_at, unread_count)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -324,9 +319,34 @@ ON CONFLICT(jid) DO UPDATE SET
         WHEN excluded.last_message_at > chats.last_message_at THEN excluded.last_message_at
         ELSE chats.last_message_at
     END
-`, chat.JID, chat.Title, NormalizeSearch(strings.Join([]string{chat.Title, chat.JID}, " ")), boolToInt(chat.IsGroup), chat.LastMessageID, chat.LastMessagePreview, chat.LastSenderName, timeString(chat.LastMessageAt), chat.UnreadCount)
+`, chat.JID, title, NormalizeSearch(strings.Join([]string{title, chat.JID}, " ")), boolToInt(chat.IsGroup), chat.LastMessageID, chat.LastMessagePreview, chat.LastSenderName, timeString(chat.LastMessageAt), chat.UnreadCount)
 	if err != nil {
 		return fmt.Errorf("upsert chat %s: %w", chat.JID, err)
+	}
+	return nil
+}
+
+// UpdateChatTitle records chat metadata for an existing chat without touching
+// message, unread, or timestamp fields. It is used for late-arriving WhatsApp
+// metadata such as group names, which may arrive after messages have already
+// created the chat row.
+func (s *Store) UpdateChatTitle(ctx context.Context, jid, title string, isGroup bool) error {
+	if ignoredChatJID(jid) {
+		return nil
+	}
+	title = cleanChatTitle(jid, title)
+	if title == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE chats
+SET title = ?,
+    normalized_title = ?,
+    is_group = CASE WHEN ? = 1 THEN 1 ELSE is_group END
+WHERE jid = ?
+`, title, NormalizeSearch(strings.Join([]string{title, jid}, " ")), boolToInt(isGroup), jid)
+	if err != nil {
+		return fmt.Errorf("update chat title %s: %w", jid, err)
 	}
 	return nil
 }
@@ -437,13 +457,17 @@ func recordMessage(ctx context.Context, tx *sql.Tx, msg domain.Message, chatTitl
 		return fmt.Errorf("read message rows affected: %w", err)
 	}
 
-	currentTitle := firstNonEmpty(strings.TrimSpace(chatTitle), msg.ChatJID)
+	// Leave title empty when nothing meaningful is known; the SQL keeps any
+	// existing non-empty title and a later resolveChatTitle pass can fill it.
+	// Falling back to msg.ChatJID here would poison chats.title with the raw
+	// JID and the ON CONFLICT clause below would freeze it.
+	currentTitle := cleanChatTitle(msg.ChatJID, chatTitle)
 	row := tx.QueryRowContext(ctx, `SELECT title FROM chats WHERE jid = ?`, msg.ChatJID)
 	var existingTitle string
 	switch scanErr := row.Scan(&existingTitle); scanErr {
 	case nil:
-		if existingTitle != "" {
-			currentTitle = existingTitle
+		if cleanExisting := cleanChatTitle(msg.ChatJID, existingTitle); cleanExisting != "" {
+			currentTitle = cleanExisting
 		}
 	case sql.ErrNoRows:
 	default:
@@ -774,15 +798,32 @@ func parseTime(raw string) time.Time {
 
 func previewText(text string) string {
 	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
-	const maxLen = 80
-	if len(text) <= maxLen {
+	const maxRunes = 80
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
 		return text
 	}
-	return text[:maxLen-1] + "…"
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 func ignoredChatJID(jid string) bool {
 	return jid == "status@broadcast"
+}
+
+func cleanChatTitle(jid, title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" || title == strings.TrimSpace(jid) || title == jidUserPart(jid) {
+		return ""
+	}
+	return title
+}
+
+func jidUserPart(jid string) string {
+	jid = strings.TrimSpace(jid)
+	if idx := strings.IndexByte(jid, '@'); idx > 0 {
+		return jid[:idx]
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

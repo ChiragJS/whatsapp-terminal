@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	qrterminal "github.com/mdp/qrterminal/v3"
 
 	"github.com/chirag/whatsapp-terminal/internal/domain"
@@ -22,8 +24,7 @@ import (
 )
 
 const (
-	chatListLimit        = 200
-	defaultChatListLimit = 5
+	defaultChatListLimit = 500
 	messageLimit         = 200
 	messagePageSize      = 100
 	historyRequestCount  = 50
@@ -31,6 +32,9 @@ const (
 	threadPageScroll     = 8
 	threadMouseScroll    = 3
 	maxPathSuggestions   = 5
+	chatItemLineCount    = 2
+	chatListHelpText     = "j/k move  enter open  / search  r refresh  T theme  esc·q quit"
+	smallCapRuleMargin   = 6
 )
 
 type viewMode int
@@ -86,6 +90,10 @@ type stagedAttachment struct {
 	path  string
 	kind  domain.MediaKind
 	secs  time.Duration
+	// temp marks files created by the app (clipboard captures, voice
+	// recordings) that should be deleted once the draft is sent or
+	// discarded. User-picked files are never removed.
+	temp bool
 }
 
 type attachmentStagedMsg struct {
@@ -107,10 +115,11 @@ type filePickerEntry struct {
 }
 
 type Model struct {
-	repo       *appstore.Store
-	transport  domain.Transport
-	events     <-chan domain.Event
-	fullRedraw bool
+	repo         *appstore.Store
+	transport    domain.Transport
+	events       <-chan domain.Event
+	forceRepaint bool
+	frameNonce   int
 
 	mode           viewMode
 	width          int
@@ -126,6 +135,7 @@ type Model struct {
 	recordingVoice bool
 	stoppingVoice  bool
 	selected       int
+	chatListOffset int
 	currentChatID  string
 	nextImageID    int
 	nextVoiceID    int
@@ -153,45 +163,26 @@ type Model struct {
 	threadScroll         int
 	quitArmed            bool
 	quitAfterNavigation  bool
+	dataDir              string
+	themeName            string
+	chatListLimit        int
+	logger               *slog.Logger
 }
 
+// NewModel builds a Model wired to the system clipboard, terminal bell, and
+// system voice recorder. Swap any of those with the With* methods below.
 func NewModel(repo *appstore.Store, transport domain.Transport) Model {
-	return NewModelWithOptions(repo, transport, newSystemClipboard(), newTerminalBell(), false)
-}
-
-func NewModelWithClipboard(repo *appstore.Store, transport domain.Transport, clipboard clipboardReader) Model {
-	return NewModelWithOptions(repo, transport, clipboard, newTerminalBell(), false)
-}
-
-func NewModelWithOptions(repo *appstore.Store, transport domain.Transport, clipboard clipboardReader, sounder sounder, fullRedraw bool) Model {
-	return NewModelWithRuntimeOptions(repo, transport, clipboard, sounder, newSystemVoiceRecorder(), defaultDownloadDir(), fullRedraw)
-}
-
-func NewModelWithRuntimeOptions(repo *appstore.Store, transport domain.Transport, clipboard clipboardReader, sounder sounder, recorder voiceRecorder, downloadDir string, fullRedraw bool) Model {
-	if clipboard == nil {
-		clipboard = newSystemClipboard()
-	}
-	if sounder == nil {
-		sounder = newTerminalBell()
-	}
-	if recorder == nil {
-		recorder = newSystemVoiceRecorder()
-	}
-	if strings.TrimSpace(downloadDir) == "" {
-		downloadDir = defaultDownloadDir()
-	}
-	pickerDir := defaultPickerDir()
 	search := textinput.New()
-	search.Placeholder = "Search chats (/)"
+	search.Placeholder = "filter inbox…"
 	search.Prompt = "Search: "
 	search.CharLimit = 128
 
 	composer := textarea.New()
-	composer.Placeholder = "Type a message (i)"
-	composer.Prompt = "> "
+	composer.Placeholder = "type a message…"
+	composer.Prompt = "› "
 	composer.CharLimit = 4096
 	composer.ShowLineNumbers = false
-	composer.SetHeight(3)
+	composer.SetHeight(1)
 	composer.SetWidth(48)
 
 	return Model{
@@ -202,17 +193,107 @@ func NewModelWithRuntimeOptions(repo *appstore.Store, transport domain.Transport
 		status:        "Starting WhatsApp terminal...",
 		search:        search,
 		composer:      composer,
-		clipboard:     clipboard,
-		sounder:       sounder,
-		recorder:      recorder,
-		downloadDir:   downloadDir,
-		filePickerDir: pickerDir,
-		fullRedraw:    fullRedraw,
+		clipboard:     newSystemClipboard(),
+		sounder:       newTerminalBell(),
+		recorder:      newSystemVoiceRecorder(),
+		downloadDir:   defaultDownloadDir(),
+		filePickerDir: defaultPickerDir(),
+		themeName:     currentTheme.Name,
+		chatListLimit: defaultChatListLimit,
 	}
 }
 
+// WithClipboard overrides the clipboard reader. Nil keeps the current one.
+func (m Model) WithClipboard(clipboard clipboardReader) Model {
+	if clipboard != nil {
+		m.clipboard = clipboard
+	}
+	return m
+}
+
+// WithSounder overrides the notification sounder. Nil keeps the current one.
+func (m Model) WithSounder(sounder sounder) Model {
+	if sounder != nil {
+		m.sounder = sounder
+	}
+	return m
+}
+
+// WithRecorder overrides the voice recorder. Nil keeps the current one.
+func (m Model) WithRecorder(recorder voiceRecorder) Model {
+	if recorder != nil {
+		m.recorder = recorder
+	}
+	return m
+}
+
+// WithDownloadDir overrides where media downloads land. Blank keeps the
+// current directory.
+func (m Model) WithDownloadDir(dir string) Model {
+	if strings.TrimSpace(dir) != "" {
+		m.downloadDir = dir
+	}
+	return m
+}
+
+// WithChatListLimit overrides the max chats fetched per inbox query. Values
+// <= 0 are ignored and the default (defaultChatListLimit) is kept.
+func (m Model) WithChatListLimit(limit int) Model {
+	if limit > 0 {
+		m.chatListLimit = limit
+	}
+	return m
+}
+
+// WithLogger attaches a slog logger so the UI can emit diagnostic events
+// alongside the transport. Nil silences UI logging. The logger is also
+// installed package-wide so helpers without access to Model (e.g.
+// displayChatTitle) can emit diagnostics through pkgLog.
+func (m Model) WithLogger(logger *slog.Logger) Model {
+	m.logger = logger
+	pkgLog = logger
+	return m
+}
+
+// pkgLog is a package-level logger used by helpers that have no Model
+// receiver. Set via Model.WithLogger; nil means UI logging is off.
+var pkgLog *slog.Logger
+
+func uilog(msg string, args ...any) {
+	if pkgLog == nil {
+		return
+	}
+	pkgLog.Debug("ui:"+msg, args...)
+}
+
+// WithForceRepaint makes every rendered line differ between updates without
+// changing visual output. This is useful in no-alt-screen mode where Bubble
+// Tea's diff renderer can otherwise skip rows that need to be restored after a
+// terminal autowrap/desync event.
+func (m Model) WithForceRepaint(enabled bool) Model {
+	m.forceRepaint = enabled
+	return m
+}
+
+// WithDataDir records the data directory used for persisting per-user
+// settings such as the active theme.
+func (m Model) WithDataDir(dir string) Model {
+	m.dataDir = dir
+	return m
+}
+
+// WithTheme switches the active theme. The slug is resolved via LookupTheme;
+// unknown slugs leave the previous theme in place.
+func (m Model) WithTheme(slug string) Model {
+	if t, ok := LookupTheme(slug); ok {
+		applyTheme(t)
+		m.themeName = t.Name
+	}
+	return m
+}
+
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(tea.ClearScreen, waitForTransportEvent(m.events), loadChatsCmd(m.repo, ""))
+	return tea.Batch(tea.ClearScreen, waitForTransportEvent(m.events), m.loadChats(""))
 }
 
 func (m Model) WithQuitAfterNavigation(enabled bool) Model {
@@ -234,27 +315,28 @@ func (m Model) requestQuit() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.frameNonce++
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
-		return m, m.redrawCmd()
+		m.keepSelectedChatVisible()
+		return m, nil
 	case transportEventMsg:
 		m = m.applyTransportEvent(msg.event)
-		cmds := []tea.Cmd{waitForTransportEvent(m.events), loadChatsCmd(m.repo, m.search.Value())}
+		cmds := []tea.Cmd{waitForTransportEvent(m.events), m.loadChats(m.search.Value())}
 		if m.currentChatID != "" {
 			cmds = append(cmds, loadMessagesCmd(m.repo, m.currentChatID, m.messageLoadLimit()))
 		}
 		if msg.event.Notify && m.sounder != nil {
 			_ = m.sounder.Bell()
 		}
-		cmds = append([]tea.Cmd{m.redrawCmd()}, cmds...)
 		return m, tea.Batch(cmds...)
 	case chatsLoadedMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
-			return m, m.redrawCmd()
+			return m, nil
 		}
 		if len(msg.chats) > 0 {
 			m.syncingRecent = false
@@ -270,14 +352,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return m, m.redrawCmd()
+		m.keepSelectedChatVisible()
+		return m, nil
 	case messagesLoadedMsg:
 		if msg.err != nil {
 			if msg.chatJID == m.currentChatID {
 				m.threadLoadingOlder = false
 			}
 			m.lastErr = msg.err.Error()
-			return m, m.redrawCmd()
+			return m, nil
 		}
 		if msg.chatJID == m.currentChatID {
 			previousLen := len(m.messages)
@@ -302,7 +385,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(msg.messages) == 0 && m.mode == viewThread && !m.threadHistoryPending {
 				var cmd tea.Cmd
 				m, cmd = m.loadOlderThreadMessages()
-				return m, batchCommands(m.redrawCmd(), cmd)
+				return m, cmd
 			}
 			if len(msg.messages) > 0 {
 				m.threadHistoryPending = false
@@ -310,10 +393,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if wasLoadingOlder && previousOldestID != "" && oldestMessageID(msg.messages) == previousOldestID && m.threadNearOldestBoundary() {
 				var cmd tea.Cmd
 				m, cmd = m.loadOlderThreadMessages()
-				return m, batchCommands(m.redrawCmd(), cmd)
+				return m, cmd
 			}
 		}
-		return m, m.redrawCmd()
+		return m, nil
 	case opResultMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
@@ -339,16 +422,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.threadHistoryPending = false
 			}
 			return m, tea.Batch(
-				m.redrawCmd(),
-				loadChatsCmd(m.repo, m.search.Value()),
+				m.loadChats(m.search.Value()),
 				loadMessagesCmd(m.repo, msg.chatJID, m.messageLoadLimit()),
 			)
 		}
-		return m, m.redrawCmd()
+		return m, nil
 	case attachmentStagedMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
-			return m, m.redrawCmd()
+			// A failed voice-note stop must release the stopping latch or
+			// the recorder can never be started again.
+			m.stoppingVoice = false
+			return m, nil
 		}
 		m.pendingAttachments = append(m.pendingAttachments, msg.attachment)
 		m.composer.SetValue(appendDraftToken(m.composer.Value(), msg.attachment.token))
@@ -358,11 +443,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recordingVoice = false
 		m.stoppingVoice = false
 		m.refreshPathSuggestions()
-		return m, m.redrawCmd()
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
 			return m.requestQuit()
+		case "ctrl+l":
+			// Manual full repaint: recovers the screen if the terminal ever
+			// desynchronizes (glyph-width mismatch, resize glitch, ssh noise).
+			return m, tea.ClearScreen
 		case "q":
 			if m.quitArmed && m.canQuitWithKey() {
 				return m.requestQuit()
@@ -385,16 +474,19 @@ func (m Model) View() string {
 		return "Loading terminal UI..."
 	}
 
+	var rendered string
 	if m.qrCode != "" {
-		return m.renderPairing()
+		rendered = m.renderPairing()
+		return m.fitFrame(rendered)
 	}
 
 	switch m.mode {
 	case viewThread:
-		return m.renderThread()
+		rendered = m.renderThread()
 	default:
-		return m.renderChatList()
+		rendered = m.renderChatList()
 	}
+	return m.fitFrame(rendered)
 }
 
 func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -407,33 +499,50 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitArmed = m.quitAfterNavigation
 				m.search.Blur()
 				m.search.SetValue("")
-				return m, tea.Batch(m.redrawCmd(), loadChatsCmd(m.repo, ""))
+				return m, m.loadChats("")
 			case "enter":
 				m.searching = false
 				m.search.Blur()
-				return m, m.redrawCmd()
+				return m, nil
 			}
-			var cmd tea.Cmd
-			m.search, cmd = m.search.Update(msg)
-			return m, tea.Batch(m.redrawCmd(), cmd, loadChatsCmd(m.repo, m.search.Value()))
+			m.search, _ = m.search.Update(msg)
+			return m, m.loadChats(m.search.Value())
 		}
 
 		switch msg.String() {
 		case "esc":
 			m.quitArmed = true
-			return m, m.redrawCmd()
+			return m, nil
 		case "/":
 			m.searching = true
 			m.search.Focus()
-			return m, m.redrawCmd()
+			return m, nil
 		case "j", "down":
 			m.selected = clampSelection(m.selected+1, len(m.chats))
+			m.keepSelectedChatVisible()
 			return m, nil
 		case "k", "up":
 			m.selected = clampSelection(m.selected-1, len(m.chats))
+			m.keepSelectedChatVisible()
 			return m, nil
 		case "r":
-			return m, tea.Batch(m.redrawCmd(), loadChatsCmd(m.repo, m.search.Value()))
+			return m, m.loadChats(m.search.Value())
+		case "t", "T":
+			next := nextTheme(m.themeName)
+			applyTheme(next)
+			m.themeName = next.Name
+			m.status = "Theme: " + next.Label
+			if m.dataDir != "" {
+				SaveThemeName(m.dataDir, next.Name)
+			}
+			return m, nil
+		case "D":
+			// Diagnostic dump: write the raw state of every loaded chat to
+			// the debug log so we can trace title/sender weirdness from a
+			// real cache without screen-scraping the TUI.
+			m.dumpChatListDiagnostics()
+			m.status = fmt.Sprintf("Dumped %d chats to debug log", len(m.chats))
+			return m, nil
 		case "enter":
 			chat := m.currentChat()
 			if chat == nil {
@@ -447,10 +556,9 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.threadMessageLimit = messageLimit
 			m.threadScroll = 0
 			return m, tea.Batch(
-				m.redrawCmd(),
 				resetUnreadCmd(m.repo, chat.JID),
 				loadMessagesCmd(m.repo, chat.JID, m.messageLoadLimit()),
-				loadChatsCmd(m.repo, m.search.Value()),
+				m.loadChats(m.search.Value()),
 			)
 		}
 	}
@@ -460,212 +568,224 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.MouseMsg:
-		if !m.composing {
-			switch msg.Button {
-			case tea.MouseButtonWheelUp:
-				return m.scrollThread(threadMouseScroll)
-			case tea.MouseButtonWheelDown:
-				return m.scrollThread(-threadMouseScroll)
-			}
-			return m, nil
-		}
-		if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
-			return m, nil
-		}
-		switch m.threadToolbarHit(msg.X, msg.Y) {
-		case "attach":
-			m.openFilePicker()
-			return m, m.redrawCmd()
-		case "voice":
-			return m.toggleVoiceRecording()
-		}
+		return m.updateThreadMouse(msg)
 	case tea.KeyMsg:
-		if m.composing {
-			if m.filePickerOpen {
-				switch msg.String() {
-				case "esc":
-					m.filePickerOpen = false
-					return m, m.redrawCmd()
-				case "j", "down":
-					m.filePickerSelected = clampSelection(m.filePickerSelected+1, len(m.filePickerEntries))
-					return m, m.redrawCmd()
-				case "k", "up":
-					m.filePickerSelected--
-					if m.filePickerSelected < 0 {
-						m.filePickerSelected = max(0, len(m.filePickerEntries)-1)
-					}
-					return m, m.redrawCmd()
-				case "h", "backspace":
-					m.openParentPickerDir()
-					return m, m.redrawCmd()
-				case "enter":
-					return m.pickSelectedFileEntry()
-				}
-				return m, nil
-			}
-			switch msg.String() {
-			case "esc":
-				if m.pathSuggestionFocus {
-					m.pathSuggestionFocus = false
-					return m, m.redrawCmd()
-				}
-				m.composing = false
-				m.quitArmed = m.quitAfterNavigation
-				m.composer.Blur()
-				if m.recordingVoice && m.recorder != nil {
-					_ = m.recorder.Cancel()
-					m.recordingVoice = false
-				}
-				m.clearPendingAttachments()
-				m.clearPathSuggestions()
-				m.filePickerOpen = false
-				return m, m.redrawCmd()
-			case "tab":
-				if len(m.pathSuggestions) > 0 {
-					if !m.pathSuggestionFocus {
-						m.pathSuggestionFocus = true
-						return m, m.redrawCmd()
-					}
-					if m.applySelectedPathSuggestion() {
-						return m, m.redrawCmd()
-					}
-				}
-			case "ctrl+o":
-				m.openFilePicker()
-				return m, m.redrawCmd()
-			case "+":
-				m.composer.InsertRune('+')
-				m.refreshPathSuggestions()
-				return m, m.redrawCmd()
-			case "ctrl+n":
-				if len(m.pathSuggestions) > 0 {
-					m.pathSuggestionIdx = clampSelection(m.pathSuggestionIdx+1, len(m.pathSuggestions))
-					return m, m.redrawCmd()
-				}
-			case "ctrl+p":
-				if len(m.pathSuggestions) > 0 {
-					m.pathSuggestionIdx--
-					if m.pathSuggestionIdx < 0 {
-						m.pathSuggestionIdx = len(m.pathSuggestions) - 1
-					}
-					return m, m.redrawCmd()
-				}
-			case "j", "down":
-				if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
-					m.pathSuggestionIdx = clampSelection(m.pathSuggestionIdx+1, len(m.pathSuggestions))
-					return m, m.redrawCmd()
-				}
-			case "k", "up":
-				if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
-					m.pathSuggestionIdx--
-					if m.pathSuggestionIdx < 0 {
-						m.pathSuggestionIdx = len(m.pathSuggestions) - 1
-					}
-					return m, m.redrawCmd()
-				}
-			case "ctrl+v":
-				return m, tea.Batch(m.redrawCmd(), stageClipboardImageCmd(m.clipboard, m.nextImagePlaceholder()))
-			case "alt+v":
-				return m.toggleVoiceRecording()
-			case "shift+enter", "ctrl+j", "alt+enter":
-				m.insertComposerText("\n")
-				m.refreshPathSuggestions()
-				return m, m.redrawCmd()
-			case "enter":
-				if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
-					if m.applySelectedPathSuggestion() {
-						return m, m.redrawCmd()
-					}
-				}
-				if len(m.pendingAttachments) > 0 {
-					chatID := m.currentChatID
-					attachments := append([]stagedAttachment(nil), m.pendingAttachments...)
-					caption := stripAttachmentTokens(m.composer.Value(), attachments)
-					return m, sendStagedAttachmentsCmd(m.transport, chatID, attachments, caption)
-				}
-				action, err := parseComposeAction(m.composer.Value())
-				if err != nil {
-					m.lastErr = err.Error()
-					return m, nil
-				}
-				chatID := m.currentChatID
-				switch action.kind {
-				case composeActionImage:
-					return m, sendImageCmd(m.transport, chatID, action.path, action.caption)
-				case composeActionMedia:
-					return m, sendMediaCmd(m.transport, chatID, action.path, action.caption)
-				default:
-					return m, sendTextCmd(m.transport, chatID, action.text)
-				}
-			}
-			var cmd tea.Cmd
-			m.composer, cmd = m.composer.Update(msg)
-			m.refreshPathSuggestions()
-			if len(m.pathSuggestions) == 0 {
-				m.pathSuggestionFocus = false
-			}
-			return m, tea.Batch(m.redrawCmd(), cmd)
-		}
-
-		switch msg.String() {
-		case "esc":
-			m.mode = viewChats
-			m.currentChatID = ""
-			m.messages = nil
-			m.threadHistoryPending = false
-			m.threadLoadingOlder = false
-			m.threadMessageLimit = 0
-			m.threadScroll = 0
-			m.composing = false
-			m.quitArmed = m.quitAfterNavigation
-			m.composer.Blur()
-			if m.recordingVoice && m.recorder != nil {
-				_ = m.recorder.Cancel()
-				m.recordingVoice = false
-			}
-			m.clearPendingAttachments()
-			m.clearPathSuggestions()
-			return m, tea.Batch(m.redrawCmd(), loadChatsCmd(m.repo, m.search.Value()))
-		case "i", "tab":
-			m.composing = true
-			m.refreshPathSuggestions()
-			return m, tea.Batch(m.redrawCmd(), m.composer.Focus())
-		case "k", "up":
-			return m.scrollThread(1)
-		case "j", "down":
-			return m.scrollThread(-1)
-		case "pgup", "ctrl+u":
-			return m.scrollThread(threadPageScroll)
-		case "pgdown", "ctrl+d":
-			return m.scrollThread(-threadPageScroll)
-		case "home":
-			return m.scrollThread(len(m.messages))
-		case "end":
-			if m.threadScroll == 0 {
-				return m, nil
-			}
-			m.threadScroll = 0
-			return m, m.redrawCmd()
-		case "u":
-			if m.currentChatID == "" {
-				return m, nil
-			}
-			var cmd tea.Cmd
-			m, cmd = m.loadOlderThreadMessages()
-			return m, batchCommands(m.redrawCmd(), cmd)
-		case "d":
-			if m.currentChatID == "" {
-				return m, nil
-			}
-			latest := latestDownloadableMessage(m.messages)
-			if latest == nil {
-				m.lastErr = "no downloadable media found in this thread"
-				return m, m.redrawCmd()
-			}
-			return m, downloadMediaCmd(m.transport, *latest, m.downloadDir)
+		switch {
+		case m.composing && m.filePickerOpen:
+			return m.updateFilePickerKey(msg)
+		case m.composing:
+			return m.updateComposerKey(msg)
+		default:
+			return m.updateThreadNavigationKey(msg)
 		}
 	}
 	return m, nil
+}
+
+func (m Model) updateThreadMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.composing {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			return m.scrollThread(threadMouseScroll)
+		case tea.MouseButtonWheelDown:
+			return m.scrollThread(-threadMouseScroll)
+		}
+		return m, nil
+	}
+	if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	switch m.threadToolbarHit(msg.X, msg.Y) {
+	case "attach":
+		m.openFilePicker()
+		return m, nil
+	case "voice":
+		return m.toggleVoiceRecording()
+	}
+	return m, nil
+}
+
+func (m Model) updateFilePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.filePickerOpen = false
+	case "j", "down":
+		m.filePickerSelected = cycleSelection(m.filePickerSelected, 1, len(m.filePickerEntries))
+	case "k", "up":
+		m.filePickerSelected = cycleSelection(m.filePickerSelected, -1, len(m.filePickerEntries))
+	case "h", "backspace":
+		m.openParentPickerDir()
+	case "enter":
+		return m.pickSelectedFileEntry()
+	}
+	return m, nil
+}
+
+func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		if m.pathSuggestionFocus {
+			m.pathSuggestionFocus = false
+			return m, nil
+		}
+		m.abandonCompose()
+		return m, nil
+	case "tab":
+		if len(m.pathSuggestions) > 0 {
+			if !m.pathSuggestionFocus {
+				m.pathSuggestionFocus = true
+				return m, nil
+			}
+			if m.applySelectedPathSuggestion() {
+				return m, nil
+			}
+		}
+	case "ctrl+o":
+		m.openFilePicker()
+		return m, nil
+	case "+":
+		// Insert directly so "+" always lands in the draft — even if
+		// the textarea is blurred — instead of reading as the attach
+		// toolbar button.
+		m.composer.InsertRune('+')
+		m.refreshPathSuggestions()
+		return m, nil
+	case "ctrl+n":
+		if len(m.pathSuggestions) > 0 {
+			m.pathSuggestionIdx = cycleSelection(m.pathSuggestionIdx, 1, len(m.pathSuggestions))
+			return m, nil
+		}
+	case "ctrl+p":
+		if len(m.pathSuggestions) > 0 {
+			m.pathSuggestionIdx = cycleSelection(m.pathSuggestionIdx, -1, len(m.pathSuggestions))
+			return m, nil
+		}
+	case "j", "down":
+		if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
+			m.pathSuggestionIdx = cycleSelection(m.pathSuggestionIdx, 1, len(m.pathSuggestions))
+			return m, nil
+		}
+	case "k", "up":
+		if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
+			m.pathSuggestionIdx = cycleSelection(m.pathSuggestionIdx, -1, len(m.pathSuggestions))
+			return m, nil
+		}
+	case "ctrl+v":
+		return m, stageClipboardImageCmd(m.clipboard, m.nextImagePlaceholder())
+	case "alt+v":
+		return m.toggleVoiceRecording()
+	case "ctrl+j", "alt+enter", "shift+enter":
+		// ctrl+j is the reliable newline: terminals send a plain CR for
+		// shift+enter, indistinguishable from enter, so "shift+enter" only
+		// fires in the rare setups that report it distinctly.
+		m.composer.InsertString("\n")
+		m.refreshPathSuggestions()
+		return m, nil
+	case "enter":
+		return m.submitComposer()
+	}
+	var cmd tea.Cmd
+	m.composer, cmd = m.composer.Update(msg)
+	m.refreshPathSuggestions()
+	if len(m.pathSuggestions) == 0 {
+		m.pathSuggestionFocus = false
+	}
+	return m, cmd
+}
+
+// submitComposer sends the current draft: staged attachments first, else the
+// parsed compose action (/image, /media, or plain text).
+func (m Model) submitComposer() (tea.Model, tea.Cmd) {
+	if m.pathSuggestionFocus && len(m.pathSuggestions) > 0 {
+		if m.applySelectedPathSuggestion() {
+			return m, nil
+		}
+	}
+	chatID := m.currentChatID
+	if len(m.pendingAttachments) > 0 {
+		attachments := append([]stagedAttachment(nil), m.pendingAttachments...)
+		caption := stripAttachmentTokens(m.composer.Value(), attachments)
+		return m, sendStagedAttachmentsCmd(m.transport, chatID, attachments, caption)
+	}
+	action, err := parseComposeAction(m.composer.Value())
+	if err != nil {
+		m.lastErr = err.Error()
+		return m, nil
+	}
+	switch action.kind {
+	case composeActionImage:
+		return m, sendImageCmd(m.transport, chatID, action.path, action.caption)
+	case composeActionMedia:
+		return m, sendMediaCmd(m.transport, chatID, action.path, action.caption)
+	default:
+		return m, sendTextCmd(m.transport, chatID, action.text)
+	}
+}
+
+func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = viewChats
+		m.currentChatID = ""
+		m.messages = nil
+		m.threadHistoryPending = false
+		m.threadLoadingOlder = false
+		m.threadMessageLimit = 0
+		m.threadScroll = 0
+		m.abandonCompose()
+		return m, m.loadChats(m.search.Value())
+	case "i", "tab":
+		m.composing = true
+		m.refreshPathSuggestions()
+		return m, m.composer.Focus()
+	case "k", "up":
+		return m.scrollThread(1)
+	case "j", "down":
+		return m.scrollThread(-1)
+	case "pgup", "ctrl+u":
+		return m.scrollThread(threadPageScroll)
+	case "pgdown", "ctrl+d":
+		return m.scrollThread(-threadPageScroll)
+	case "home":
+		return m.scrollThread(len(m.messages))
+	case "end":
+		m.threadScroll = 0
+		return m, nil
+	case "u":
+		if m.currentChatID == "" {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m, cmd = m.loadOlderThreadMessages()
+		return m, cmd
+	case "d":
+		if m.currentChatID == "" {
+			return m, nil
+		}
+		latest := latestDownloadableMessage(m.messages)
+		if latest == nil {
+			m.lastErr = "no downloadable media found in this thread"
+			return m, nil
+		}
+		return m, downloadMediaCmd(m.transport, *latest, m.downloadDir)
+	}
+	return m, nil
+}
+
+// abandonCompose leaves compose mode and discards the draft's transient
+// state: an in-flight voice recording, staged attachments, path suggestions,
+// and the file picker.
+func (m *Model) abandonCompose() {
+	m.composing = false
+	m.quitArmed = m.quitAfterNavigation
+	m.composer.Blur()
+	if m.recordingVoice && m.recorder != nil {
+		_ = m.recorder.Cancel()
+		m.recordingVoice = false
+	}
+	m.clearPendingAttachments()
+	m.clearPathSuggestions()
+	m.filePickerOpen = false
 }
 
 func (m Model) applyTransportEvent(event domain.Event) Model {
@@ -698,83 +818,138 @@ func (m Model) applyTransportEvent(event domain.Event) Model {
 }
 
 func (m Model) renderPairing() string {
-	header := m.renderHeader("Pair your phone", "Scan the QR code from WhatsApp")
-	status := mutedStyle.Render("Open WhatsApp on your phone, choose Linked Devices, then scan the code below.")
+	header := m.renderHeader("Pair device", "Scan the QR code from WhatsApp")
+	step := func(n int, label string) string {
+		return chipKeyStyle.Render(fmt.Sprintf("%d", n)) + subtleStyle.Render(" · ") + slateStyle.Render(label)
+	}
+	steps := lipgloss.JoinHorizontal(lipgloss.Top,
+		step(1, "Open WhatsApp"),
+		subtleStyle.Render("   →   "),
+		step(2, "Linked Devices"),
+		subtleStyle.Render("   →   "),
+		step(3, "Scan below"),
+	)
+	caption := slateStyle.Render("Awaiting handshake from your phone…")
 	if m.lastErr != "" {
-		status += "\n" + errorStyle.Render(m.lastErr)
+		caption = errorStyle.Render("✕ ") + slateStyle.Render(m.lastErr)
 	}
 	qr := qrBoxStyle.Render(m.qrCode)
+	footnote := subtleStyle.Render("[") + chipKeyStyle.Render("esc·q") + subtleStyle.Render("]") + " " + chipLabelStyle.Render("quit")
 	content := lipgloss.JoinVertical(
 		lipgloss.Center,
-		status,
+		steps,
+		"",
+		caption,
 		"",
 		qr,
 		"",
-		mutedStyle.Render("Press esc then q to quit."),
+		footnote,
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, lipgloss.Place(m.width, max(10, m.height-4), lipgloss.Center, lipgloss.Top, content))
 }
 
-func (m Model) renderChatList() string {
+// chatListViewLayout captures the per-frame geometry of the chat-list view.
+// Narrow terminals (contentWidth < 68) stack all panels full-width; wider
+// ones put search+list in a left column and the preview on the right.
+type chatListViewLayout struct {
+	contentWidth  int
+	searchHeight  int
+	listHeight    int
+	previewHeight int
+	stacked       bool
+}
+
+func (m Model) chatListLayout() chatListViewLayout {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader("Inbox", "")
-	footer := m.renderFooter("j/k move  enter open  / search  r refresh  esc then q quit")
+	footer := m.renderFooter(chatListHelpText)
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
-	if contentWidth < 68 {
-		searchHeight := 3
-		previewHeight := max(8, bodyHeight/3)
-		listHeight := max(8, bodyHeight-searchHeight-previewHeight)
-		searchBar := renderPanel(boxMutedStyle, contentWidth, searchHeight, m.searchBarText())
-		chatList := renderPanel(boxStyle, contentWidth, listHeight, m.chatListBody(contentWidth-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(listHeight)))
-		preview := renderPanel(boxStyle, contentWidth, previewHeight, m.chatPreviewBody(contentWidth-boxStyle.GetHorizontalFrameSize()))
+	layout := chatListViewLayout{
+		contentWidth: contentWidth,
+		searchHeight: 3,
+		stacked:      contentWidth < 68,
+	}
+	if layout.stacked {
+		layout.previewHeight = max(8, bodyHeight/3)
+		layout.listHeight = max(8, bodyHeight-layout.searchHeight-layout.previewHeight)
+		return layout
+	}
+	layout.listHeight = max(8, bodyHeight-layout.searchHeight)
+	layout.previewHeight = bodyHeight
+	return layout
+}
+
+func (m Model) renderChatList() string {
+	header := m.renderHeader("Inbox", "")
+	footer := m.renderFooter(chatListHelpText)
+	layout := m.chatListLayout()
+	if layout.stacked {
+		width := layout.contentWidth
+		searchBar := renderPanel(boxMutedStyle, width, layout.searchHeight, m.searchBarText(width-boxMutedStyle.GetHorizontalFrameSize()))
+		chatList := renderPanel(boxStyle, width, layout.listHeight, m.chatListBody(width-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(layout.listHeight)))
+		preview := renderPanel(boxStyle, width, layout.previewHeight, m.chatPreviewBody(width-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(layout.previewHeight)))
 		return lipgloss.JoinVertical(lipgloss.Left, header, searchBar, chatList, preview, footer)
 	}
 
-	leftWidth, rightWidth := m.splitWidths(contentWidth)
-	searchHeight := 3
-	listHeight := max(8, bodyHeight-searchHeight)
-	searchBar := renderPanel(boxMutedStyle, leftWidth, searchHeight, m.searchBarText())
-	chatList := renderPanel(boxStyle, leftWidth, listHeight, m.chatListBody(leftWidth-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(listHeight)))
-	preview := renderPanel(boxStyle, rightWidth, bodyHeight, m.chatPreviewBody(rightWidth-boxStyle.GetHorizontalFrameSize()))
+	leftWidth, rightWidth := m.splitWidths(layout.contentWidth)
+	searchBar := renderPanel(boxMutedStyle, leftWidth, layout.searchHeight, m.searchBarText(leftWidth-boxMutedStyle.GetHorizontalFrameSize()))
+	chatList := renderPanel(boxStyle, leftWidth, layout.listHeight, m.chatListBody(leftWidth-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(layout.listHeight)))
+	preview := renderPanel(boxStyle, rightWidth, layout.previewHeight, m.chatPreviewBody(rightWidth-boxStyle.GetHorizontalFrameSize(), paddedContentHeight(layout.previewHeight)))
 	leftColumn := lipgloss.JoinVertical(lipgloss.Left, searchBar, chatList)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, lipgloss.NewStyle().Width(1).Render(""), preview)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
-func (m Model) renderThread() string {
+// threadViewLayout captures the per-frame geometry of the thread view.
+// renderThread and threadToolbarHit both read it, so rendering and mouse
+// hit-testing can never disagree about where a row sits.
+type threadViewLayout struct {
+	contentWidth    int
+	headerLines     int
+	messageHeight   int
+	composerHeight  int
+	composerContent string
+}
+
+func (m Model) threadLayout() threadViewLayout {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader(m.threadTitle(), "")
 	footer := m.renderFooter(m.threadHelpText())
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
-	if m.composing {
-		composerWidth := contentWidth - boxMutedStyle.GetHorizontalFrameSize()
-		maxComposerHeight := max(3, bodyHeight/3)
-		m.resizeComposer(composerWidth, maxComposerHeight)
-	}
 	composerContent := m.composerBody(contentWidth - boxMutedStyle.GetHorizontalFrameSize())
 	composerHeight := max(3, countRenderedLines(composerContent)+boxMutedStyle.GetVerticalFrameSize())
-	messageHeight := max(8, bodyHeight-composerHeight)
-	threadContentHeight := paddedContentHeight(messageHeight)
-	messages := renderPanel(boxStyle, contentWidth, messageHeight, m.threadBody(threadContentHeight, contentWidth-boxStyle.GetHorizontalFrameSize()))
-	composer := renderPanel(boxMutedStyle, contentWidth, composerHeight, composerContent)
+	return threadViewLayout{
+		contentWidth:    contentWidth,
+		headerLines:     countRenderedLines(header),
+		messageHeight:   max(8, bodyHeight-composerHeight),
+		composerHeight:  composerHeight,
+		composerContent: composerContent,
+	}
+}
+
+func (m Model) renderThread() string {
+	header := m.renderHeader(m.threadTitle(), "")
+	footer := m.renderFooter(m.threadHelpText())
+	if m.composing {
+		contentWidth := max(48, m.width-2)
+		bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
+		m.resizeComposer(contentWidth-boxMutedStyle.GetHorizontalFrameSize(), max(3, bodyHeight/3))
+	}
+	layout := m.threadLayout()
+	messages := renderPanel(boxStyle, layout.contentWidth, layout.messageHeight,
+		m.threadBody(paddedContentHeight(layout.messageHeight), layout.contentWidth-boxStyle.GetHorizontalFrameSize()))
+	composer := renderPanel(boxMutedStyle, layout.contentWidth, layout.composerHeight, layout.composerContent)
 	return lipgloss.JoinVertical(lipgloss.Left, header, messages, composer, footer)
 }
 
 func (m Model) threadHelpText() string {
 	if m.composing {
 		if m.quitAfterNavigation {
-			return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image  esc then q quit"
+			return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste  esc·q quit"
 		}
-		return "enter send  shift+enter newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste image"
+		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
 	}
 	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download"
-}
-
-func (m Model) redrawCmd() tea.Cmd {
-	if !m.fullRedraw {
-		return nil
-	}
-	return tea.ClearScreen
 }
 
 func (m Model) currentChat() *domain.ChatSummary {
@@ -794,14 +969,198 @@ func (m Model) selectedChatJID() string {
 
 func (m Model) threadTitle() string {
 	if chat := m.currentChat(); chat != nil && chat.JID == m.currentChatID {
-		return chat.Title
+		return displayChatTitle(*chat)
 	}
 	for _, chat := range m.chats {
 		if chat.JID == m.currentChatID {
-			return chat.Title
+			return displayChatTitle(chat)
 		}
 	}
-	return m.currentChatID
+	return displayTitleFromJID(m.currentChatID)
+}
+
+// displayChatTitle returns a friendly title for a chat row. WhatsApp groups
+// often arrive without metadata; in those cases the cached row may have an
+// empty title (current code) or a raw JID baked in (older code, before the
+// store fix). Either way we render something readable and stable.
+func displayChatTitle(chat domain.ChatSummary) string {
+	title := collapseWhitespace(chat.Title)
+	reason := titleFallbackReason(chat.JID, title)
+	if reason == "" {
+		uilog("displayChatTitle.passthrough", "jid", chat.JID, "title_raw", chat.Title, "title_clean", title)
+		return title
+	}
+	out := displayTitleFromJID(chat.JID)
+	uilog("displayChatTitle.fallback", "reason", reason, "jid", chat.JID, "title_raw", chat.Title, "out", out)
+	return out
+}
+
+// titleFallbackReason reports why a stored title is unusable for display, or
+// "" when it is fine as-is.
+func titleFallbackReason(jid, title string) string {
+	switch {
+	case title == "":
+		return "empty"
+	case title == jid:
+		return "title_eq_jid"
+	case title == jidUserPart(jid):
+		return "title_eq_jid_user"
+	case isPhoneLikeArtifact(title):
+		return "phone_like_artifact"
+	case isLongDigitRun(title):
+		return "long_digit_run"
+	default:
+		return ""
+	}
+}
+
+func isLongDigitRun(s string) bool {
+	if len(s) < 10 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isPhoneLikeArtifact(s string) bool {
+	s = collapseWhitespace(s)
+	if s == "" {
+		return false
+	}
+	digits := 0
+	hasPhoneMarker := strings.HasPrefix(s, "+")
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r == '+' || r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+			// phone formatting
+		case r == '∙' || r == '•' || r == '·' || r == '*':
+			hasPhoneMarker = true
+		default:
+			return false
+		}
+	}
+	return hasPhoneMarker && digits >= 4
+}
+
+// displaySenderLabel masks raw JID-shaped sender values (digit-only strings
+// or full JIDs) into a stable short label so group previews don't read like
+// "234273336496234: hello". A real contact name passes through untouched.
+func displaySenderLabel(name string) string {
+	name = collapseWhitespace(name)
+	if name == "" {
+		return ""
+	}
+	// Full JID like "234273336496234@s.whatsapp.net" -> use user part.
+	user := jidUserPart(name)
+	if user == "" {
+		user = name
+	}
+	if isPhoneLikeArtifact(name) {
+		return digitTailLabel(name)
+	}
+	if isLongDigitRun(user) {
+		return digitTailLabel(user)
+	}
+	return name
+}
+
+func digitTailLabel(input string) string {
+	tail := digitTail(input)
+	if tail == "" {
+		return "…"
+	}
+	return "…" + tail
+}
+
+func digitTail(input string) string {
+	digits := make([]rune, 0, len(input))
+	for _, r := range input {
+		if r >= '0' && r <= '9' {
+			digits = append(digits, r)
+		}
+	}
+	if n := len(digits); n > 4 {
+		digits = digits[n-4:]
+	}
+	return string(digits)
+}
+
+// collapseWhitespace joins newlines/tabs/runs of spaces into a single space.
+// Used by display helpers so styled lines stay on a single visual row even
+// when upstream titles contain embedded line breaks.
+func collapseWhitespace(s string) string {
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func jidUserPart(jid string) string {
+	jid = strings.TrimSpace(jid)
+	if idx := strings.IndexByte(jid, '@'); idx > 0 {
+		return jid[:idx]
+	}
+	return ""
+}
+
+func displayTitleFromJID(jid string) string {
+	jid = strings.TrimSpace(jid)
+	if jid == "" {
+		return "Unnamed chat"
+	}
+	at := strings.IndexByte(jid, '@')
+	user := jid
+	server := ""
+	if at >= 0 {
+		user = jid[:at]
+		server = jid[at+1:]
+	}
+	switch server {
+	case "g.us", "broadcast":
+		// Group/broadcast IDs are long opaque digit strings. Show the last
+		// four so two unknowns are still distinguishable.
+		label := "Unnamed group"
+		if server == "broadcast" {
+			label = "Broadcast list"
+		}
+		return digitLabel(label, user)
+	case "s.whatsapp.net":
+		if user != "" {
+			return digitLabel("Unknown contact", user)
+		}
+	case "lid":
+		// WhatsApp Linked ID — opaque digit string, treat as anonymous contact.
+		return digitLabel("Linked contact", user)
+	case "":
+		// No '@' at all. If it's a long digit run, treat as a phone number;
+		// otherwise fall through to the raw jid.
+		if isLongDigitRun(user) {
+			return digitLabel("Unknown contact", user)
+		}
+	}
+	// Last-resort: if the user portion is digit-only, render a friendly
+	// label rather than dumping the raw jid.
+	if isLongDigitRun(user) {
+		return digitLabel("Unknown contact", user)
+	}
+	return jid
+}
+
+func digitLabel(prefix, user string) string {
+	tail := digitTail(user)
+	if tail == "" {
+		return prefix
+	}
+	return prefix + " · …" + tail
 }
 
 func waitForTransportEvent(events <-chan domain.Event) tea.Cmd {
@@ -814,15 +1173,45 @@ func waitForTransportEvent(events <-chan domain.Event) tea.Cmd {
 	}
 }
 
-func loadChatsCmd(repo *appstore.Store, query string) tea.Cmd {
+func loadChatsCmd(repo *appstore.Store, query string, limit int) tea.Cmd {
+	if limit <= 0 {
+		limit = defaultChatListLimit
+	}
 	return func() tea.Msg {
-		limit := chatListLimit
-		if strings.TrimSpace(query) == "" {
-			limit = defaultChatListLimit
-		}
 		chats, err := repo.ListChats(context.Background(), query, limit)
 		return chatsLoadedMsg{chats: chats, err: err}
 	}
+}
+
+func (m Model) loadChats(query string) tea.Cmd {
+	return loadChatsCmd(m.repo, query, m.chatListLimit)
+}
+
+// dumpChatListDiagnostics writes the raw chat-list state to the debug log.
+// Each row gets a structured entry capturing the field values that drive the
+// renderer so we can diff "what we have" against "what we render".
+func (m Model) dumpChatListDiagnostics() {
+	if m.logger == nil {
+		return
+	}
+	m.logger.Debug("ui:dump.begin", "chats", len(m.chats), "selected", m.selected, "search", m.search.Value())
+	for idx, chat := range m.chats {
+		m.logger.Debug("ui:dump.chat",
+			"idx", idx,
+			"jid", chat.JID,
+			"title_raw", chat.Title,
+			"title_quoted", fmt.Sprintf("%q", chat.Title),
+			"is_group", chat.IsGroup,
+			"unread", chat.UnreadCount,
+			"sender_raw", chat.LastSenderName,
+			"sender_quoted", fmt.Sprintf("%q", chat.LastSenderName),
+			"preview_raw", chat.LastMessagePreview,
+			"display_title", displayChatTitle(chat),
+			"display_sender", displaySenderLabel(chat.LastSenderName),
+			"last_at", chat.LastMessageAt,
+		)
+	}
+	m.logger.Debug("ui:dump.end")
 }
 
 func loadMessagesCmd(repo *appstore.Store, chatJID string, limit int) tea.Cmd {
@@ -887,7 +1276,7 @@ func stageClipboardImageCmd(clipboard clipboardReader, token string) tea.Cmd {
 			return attachmentStagedMsg{err: fmt.Errorf("close clipboard image file: %w", err)}
 		}
 		return attachmentStagedMsg{
-			attachment: stagedAttachment{token: token, path: path, kind: domain.MediaKindImage},
+			attachment: stagedAttachment{token: token, path: path, kind: domain.MediaKindImage, temp: true},
 			status:     "Clipboard image pasted into draft",
 		}
 	}
@@ -903,7 +1292,7 @@ func stopVoiceRecordingCmd(recorder voiceRecorder, token string) tea.Cmd {
 			return attachmentStagedMsg{err: err}
 		}
 		return attachmentStagedMsg{
-			attachment: stagedAttachment{token: token, path: result.Path, kind: domain.MediaKindVoice, secs: result.Duration},
+			attachment: stagedAttachment{token: token, path: result.Path, kind: domain.MediaKindVoice, secs: result.Duration, temp: true},
 			status:     "Voice note added to draft",
 		}
 	}
@@ -911,35 +1300,27 @@ func stopVoiceRecordingCmd(recorder voiceRecorder, token string) tea.Cmd {
 
 func sendStagedAttachmentsCmd(transport domain.Transport, chatJID string, attachments []stagedAttachment, draft string) tea.Cmd {
 	return func() tea.Msg {
-		captionConsumed := false
+		// The draft text captions the first image/media attachment; voice
+		// notes cannot carry captions. Whatever is left is sent as text.
+		caption := strings.TrimSpace(draft)
 		for _, attachment := range attachments {
+			var err error
 			switch attachment.kind {
 			case domain.MediaKindVoice:
-				if err := transport.SendVoiceNote(context.Background(), chatJID, attachment.path, attachment.secs); err != nil {
-					return opResultMsg{err: err}
-				}
+				err = transport.SendVoiceNote(context.Background(), chatJID, attachment.path, attachment.secs)
 			case domain.MediaKindImage:
-				imageCaption := ""
-				if !captionConsumed {
-					imageCaption = draft
-					captionConsumed = imageCaption != ""
-				}
-				if err := transport.SendImage(context.Background(), chatJID, attachment.path, imageCaption); err != nil {
-					return opResultMsg{err: err}
-				}
+				err = transport.SendImage(context.Background(), chatJID, attachment.path, caption)
+				caption = ""
 			default:
-				mediaCaption := ""
-				if !captionConsumed {
-					mediaCaption = draft
-					captionConsumed = mediaCaption != ""
-				}
-				if err := transport.SendMedia(context.Background(), chatJID, attachment.path, mediaCaption); err != nil {
-					return opResultMsg{err: err}
-				}
+				err = transport.SendMedia(context.Background(), chatJID, attachment.path, caption)
+				caption = ""
+			}
+			if err != nil {
+				return opResultMsg{err: err}
 			}
 		}
-		if remaining := strings.TrimSpace(draft); remaining != "" && !captionConsumed {
-			if err := transport.SendText(context.Background(), chatJID, remaining); err != nil {
+		if caption != "" {
+			if err := transport.SendText(context.Background(), chatJID, caption); err != nil {
 				return opResultMsg{err: err}
 			}
 		}
@@ -995,27 +1376,18 @@ func clampSelection(selected, total int) int {
 	return selected
 }
 
-func batchCommands(cmds ...tea.Cmd) tea.Cmd {
-	filtered := make([]tea.Cmd, 0, len(cmds))
-	for _, cmd := range cmds {
-		if cmd != nil {
-			filtered = append(filtered, cmd)
-		}
+// cycleSelection moves a list selection by delta, wrapping at both ends.
+// Used by the small pop-up lists (file picker, path suggestions) where
+// wrap-around navigation is expected.
+func cycleSelection(selected, delta, total int) int {
+	if total <= 0 {
+		return 0
 	}
-	if len(filtered) == 0 {
-		return nil
+	selected = (selected + delta) % total
+	if selected < 0 {
+		selected += total
 	}
-	if len(filtered) == 1 {
-		return filtered[0]
-	}
-	return tea.Batch(filtered...)
-}
-
-func suffix(input string) string {
-	if input == "" {
-		return ""
-	}
-	return " · " + input
+	return selected
 }
 
 func receiptSuffix(msg domain.Message) string {
@@ -1024,11 +1396,11 @@ func receiptSuffix(msg domain.Message) string {
 	}
 	switch msg.Receipt {
 	case domain.ReceiptStateRead:
-		return "  " + mutedStyle.Render("✓✓ read")
+		return "  " + receiptReadStyle.Render("●") + " " + subtleStyle.Render("read")
 	case domain.ReceiptStateDelivered:
-		return "  " + mutedStyle.Render("✓✓ delivered")
+		return "  " + receiptDeliveredStyle.Render("◐") + " " + subtleStyle.Render("delivered")
 	case domain.ReceiptStateSent:
-		return "  " + mutedStyle.Render("✓ sent")
+		return "  " + receiptSentStyle.Render("◌") + " " + subtleStyle.Render("sent")
 	default:
 		return ""
 	}
@@ -1048,28 +1420,161 @@ func renderQRCode(code string) string {
 }
 
 func (m Model) renderHeader(title, subtitle string) string {
-	left := lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("WhatsApp Terminal"), mutedStyle.Render(title))
 	width := max(40, m.width-2)
-	if subtitle != "" {
-		right := mutedStyle.Render(truncateText(subtitle, max(16, m.width/3)))
-		return headerStyle.Width(width).Render(lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.NewStyle().Width(max(1, width-lipgloss.Width(left)-lipgloss.Width(right)-2)).Render(""), right))
+	brand := brandStyle.Render("WHATSAPP") + subtleStyle.Render(" · ") + titleStyle.Render("TERMINAL")
+	dot, dotLabel := m.statusIndicator()
+	section := strings.ToUpper(strings.TrimSpace(title))
+	if section == "" {
+		section = "INBOX"
 	}
-	return headerStyle.Width(width).Render(left)
+
+	rightParts := []string{}
+	if dot != "" {
+		rightParts = append(rightParts, dot+" "+mutedStyle.Render(dotLabel))
+	}
+	if subtitle != "" {
+		rightParts = append(rightParts, slateStyle.Render(truncateText(subtitle, max(16, width/3))))
+	}
+	right := strings.Join(rightParts, mutedStyle.Render("  ·  "))
+
+	// The header must stay on a single line: a wrapped header shifts every
+	// panel below it. When space runs short, shed chrome in order — compact
+	// the brand, drop the status label, drop the status dot — and clip the
+	// section title only as a last resort, since identifying the open chat
+	// matters more than branding or "live".
+	budget := width - headerStyle.GetHorizontalPadding()
+	needed := func() int {
+		n := lipgloss.Width(brand) + 3 + 4 + ansi.StringWidth(section) // brand gap + "— " + " —"
+		if right != "" {
+			n += 1 + lipgloss.Width(right)
+		}
+		return n
+	}
+	if needed() > budget {
+		brand = brandStyle.Render("WHATSAPP")
+	}
+	if needed() > budget && dot != "" {
+		right = dot
+	}
+	if needed() > budget {
+		right = ""
+	}
+	sectionMax := budget - lipgloss.Width(brand) - 3 - 4
+	if right != "" {
+		sectionMax -= 1 + lipgloss.Width(right)
+	}
+	section = truncateText(section, max(8, sectionMax))
+	sectionLabel := subtleStyle.Render("— ") + sectionStyle.Render(section) + subtleStyle.Render(" —")
+
+	leftCluster := brand + "   " + sectionLabel
+	gap := max(1, budget-lipgloss.Width(leftCluster)-lipgloss.Width(right))
+	topLine := headerStyle.Width(width).Render(leftCluster + strings.Repeat(" ", gap) + right)
+	rule := hairlineStyle.Render(strings.Repeat("─", width))
+	return lipgloss.JoinVertical(lipgloss.Left, "", topLine, rule)
+}
+
+func (m Model) statusIndicator() (string, string) {
+	switch {
+	case m.lastErr != "" && !m.ready:
+		return statusDotErrStyle.Render("●"), "offline"
+	case m.syncingRecent:
+		return statusDotWarnStyle.Render("●"), "syncing"
+	case m.ready:
+		return statusDotOnStyle.Render("●"), "live"
+	default:
+		return subtleStyle.Render("○"), "idle"
+	}
 }
 
 func (m Model) renderFooter(help string) string {
-	lines := []string{mutedStyle.Render(help)}
+	width := max(40, m.width-2)
+	rule := hairlineStyle.Render(strings.Repeat("─", width))
+	chips := renderChipHelp(help, width)
+	// Always emit exactly three lines: rule, chips, status. Keeping the
+	// height stable between frames is what lets Bubble Tea's diff renderer
+	// fully overwrite the upper panels — otherwise a longer previous frame
+	// (with an error) leaves stale cells when the error clears.
+	statusLine := ""
 	if m.lastErr != "" {
-		lines = append(lines, errorStyle.Render(m.lastErr))
+		statusLine = errorStyle.Render("✕ ") + slateStyle.Render(truncateText(m.lastErr, max(10, width-4)))
 	}
-	return footerStyle.Width(max(40, m.width-2)).Render(strings.Join(lines, "\n"))
+	return strings.Join([]string{
+		rule,
+		footerStyle.Width(width).Render(chips),
+		footerStyle.Width(width).Render(statusLine),
+	}, "\n")
 }
 
-func (m Model) searchBarText() string {
-	if m.searching || m.search.Value() != "" {
-		return m.search.View()
+// renderChipHelp parses a "key label  key label" string and renders chips:
+// `[key] label   [key] label`. The key for each pair is everything up to the
+// last space inside that pair; everything after the last space is the label.
+// Chips are appended only while they fit within width; the rest are dropped.
+func renderChipHelp(help string, width int) string {
+	help = strings.TrimSpace(help)
+	if help == "" {
+		return ""
 	}
-	return mutedStyle.Render("Press / to search chats by name or JID")
+	parts := strings.Split(help, "  ")
+	sep := subtleStyle.Render("   ")
+	var b strings.Builder
+	used := 0
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		idx := strings.LastIndex(p, " ")
+		key, label := p, ""
+		if idx > 0 {
+			key, label = p[:idx], p[idx+1:]
+		}
+		var chip strings.Builder
+		chip.WriteString(subtleStyle.Render("["))
+		chip.WriteString(chipKeyStyle.Render(key))
+		chip.WriteString(subtleStyle.Render("]"))
+		if label != "" {
+			chip.WriteString(" ")
+			chip.WriteString(chipLabelStyle.Render(label))
+		}
+		chipStr := chip.String()
+		chipW := lipgloss.Width(chipStr)
+		sepW := 0
+		if i > 0 {
+			sepW = lipgloss.Width(sep)
+		}
+		if used+sepW+chipW > width {
+			break
+		}
+		if i > 0 {
+			b.WriteString(sep)
+			used += sepW
+		}
+		b.WriteString(chipStr)
+		used += chipW
+	}
+	return b.String()
+}
+
+func (m Model) searchBarText(width int) string {
+	width = max(8, width)
+	if m.searching || m.search.Value() != "" {
+		prompt := "Search: "
+		cursor := ""
+		if m.searching {
+			cursor = "█"
+		}
+		valueWidth := max(0, width-lipgloss.Width(prompt)-lipgloss.Width(cursor))
+		value := m.search.Value()
+		if m.searching {
+			// While typing the cursor sits at the end, so keep the tail
+			// visible; otherwise long queries hide what is being typed.
+			value = truncateTextHead(value, valueWidth)
+		} else {
+			value = truncateText(value, valueWidth)
+		}
+		return slateStyle.Render(prompt) + bodyStyle.Render(value) + chipKeyStyle.Render(cursor)
+	}
+	return slateStyle.Render("filter inbox  ") + chipKeyStyle.Render("/") + slateStyle.Render(" to focus")
 }
 
 func (m Model) chatListBody(width, height int) string {
@@ -1078,124 +1583,246 @@ func (m Model) chatListBody(width, height int) string {
 	if len(m.chats) == 0 {
 		if m.syncingRecent {
 			lines := []string{
-				metaStyle.Render("Syncing recent chats"),
-				mutedStyle.Render(wrapText("Waiting for your phone to send the first recent chat batch. The inbox will appear as soon as a few recent conversations arrive.", width)),
+				smallCap("Syncing recent chats", width),
+				slateStyle.Render(wrapText("Waiting for your phone to send the first batch. The inbox appears as soon as recent conversations arrive.", width)),
 			}
 			if strings.TrimSpace(m.status) != "" {
-				lines = append(lines, "", mutedStyle.Render(wrapText("Status: "+m.status, width)))
+				lines = append(lines, "", subtleStyle.Render(wrapText("· "+m.status, width)))
 			}
 			return strings.Join(lines, "\n")
 		}
-		return wrapText("No cached chats yet.\n\nUse --demo for an offline dataset, or pair a live session to populate the cache.", width)
+		return slateStyle.Render(wrapText("No cached chats yet.", width)) + "\n\n" +
+			subtleStyle.Render(wrapText("Use --demo for an offline dataset, or pair a live session to populate the cache.", width))
 	}
 
-	type renderedChat struct {
-		text  string
-		lines int
-	}
-	rendered := make([]renderedChat, 0, len(m.chats))
-	for idx, chat := range m.chats {
-		prefix := "  "
-		style := itemStyle
-		if idx == m.selected {
-			prefix = "› "
-			style = selectedItemStyle
-		}
-		timestamp := ""
-		if !chat.LastMessageAt.IsZero() {
-			timestamp = chat.LastMessageAt.Local().Format("02 Jan 15:04")
-		}
-		unread := ""
-		if chat.UnreadCount > 0 {
-			unread = fmt.Sprintf(" [%d]", chat.UnreadCount)
-		}
-		subtitle := strings.TrimSpace(chat.LastMessagePreview)
-		if subtitle == "" {
-			subtitle = "No messages yet"
-		}
-		titleWidth := max(10, width-len(prefix))
-		titleLine := truncateText(chat.Title+unread, titleWidth)
-		subtitleLine := truncateText(subtitle+suffix(timestamp), max(12, width-3))
-		line := fmt.Sprintf("%s%s\n   %s", prefix, titleLine, subtitleLine)
-		text := style.Width(width).MaxWidth(width).Render(line)
-		rendered = append(rendered, renderedChat{text: text, lines: countRenderedLines(text)})
-	}
-
-	selected := clampSelection(m.selected, len(rendered))
-	start, end := selected, selected+1
-	used := rendered[selected].lines
-	left, right := selected-1, selected+1
-	for {
-		added := false
-		if left >= 0 {
-			extra := rendered[left].lines + 1
-			if used+extra <= height {
-				start = left
-				used += extra
-				left--
-				added = true
-			}
-		}
-		if right < len(rendered) {
-			extra := rendered[right].lines + 1
-			if used+extra <= height {
-				end = right + 1
-				used += extra
-				right++
-				added = true
-			}
-		}
-		if !added {
-			break
-		}
-	}
-
+	selected := clampSelection(m.selected, len(m.chats))
+	visible := chatListVisibleRows(height, len(m.chats))
+	start := clampChatListOffset(m.chatListOffset, selected, visible, len(m.chats))
+	end := min(len(m.chats), start+visible)
 	lines := make([]string, 0, end-start)
 	for idx := start; idx < end; idx++ {
-		lines = append(lines, rendered[idx].text)
+		lines = append(lines, renderChatItem(m.chats[idx], width, idx == selected))
 	}
-	return strings.Join(lines, "\n\n")
+	return strings.Join(lines, "\n")
 }
 
-func (m Model) chatPreviewBody(width int) string {
+func (m *Model) keepSelectedChatVisible() {
+	if len(m.chats) == 0 {
+		m.selected = 0
+		m.chatListOffset = 0
+		return
+	}
+	m.selected = clampSelection(m.selected, len(m.chats))
+	visible := chatListVisibleRows(m.chatListContentHeight(), len(m.chats))
+	m.chatListOffset = clampChatListOffset(m.chatListOffset, m.selected, visible, len(m.chats))
+}
+
+func (m Model) chatListContentHeight() int {
+	return paddedContentHeight(m.chatListLayout().listHeight)
+}
+
+func chatListVisibleRows(contentHeight, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	return min(total, max(1, contentHeight/chatItemLineCount))
+}
+
+func clampChatListOffset(offset, selected, visible, total int) int {
+	if total <= 0 || visible <= 0 {
+		return 0
+	}
+	if selected < offset {
+		offset = selected
+	}
+	if selected >= offset+visible {
+		offset = selected - visible + 1
+	}
+	maxOffset := max(0, total-visible)
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		return 0
+	}
+	return offset
+}
+
+func renderChatItem(chat domain.ChatSummary, width int, selected bool) string {
+	width = max(20, width)
+	railCol := "  "
+	titleStyleApplied := slateStyle
+	if selected {
+		railCol = railStyle.Render("▌") + " "
+		titleStyleApplied = selectedItemStyle
+	}
+	// Leave a generous safety margin so styled segments do not wrap on
+	// lipgloss's stricter visual-width measurement (combining marks, padding).
+	contentWidth := width - 6
+
+	unread := ""
+	if chat.UnreadCount > 0 {
+		count := chat.UnreadCount
+		token := fmt.Sprintf("%d", count)
+		if count > 99 {
+			token = "99+"
+		}
+		// Subtle bracket frame replaces the prior bg-painted pill, which
+		// lipgloss occasionally treated as a block and pushed onto its own
+		// visual row. Plain styled text always stays inline.
+		unread = subtleStyle.Render("·") + unreadPillStyle.Render(token)
+	}
+	// Top line: title (truncated) left, unread pill right.
+	titleMax := contentWidth - lipgloss.Width(unread)
+	if lipgloss.Width(unread) > 0 {
+		titleMax--
+	}
+	title := truncateText(displayChatTitle(chat), max(4, titleMax))
+	titleRendered := titleStyleApplied.Render(title)
+	topGap := max(1, contentWidth-lipgloss.Width(titleRendered)-lipgloss.Width(unread))
+	topLine := railCol + titleRendered + strings.Repeat(" ", topGap) + unread
+
+	// Bottom line: preview left, relative time right.
+	preview := collapseWhitespace(chat.LastMessagePreview)
+	if preview == "" {
+		preview = "No messages yet"
+	}
+	if chat.LastSenderName != "" && chat.IsGroup {
+		preview = displaySenderLabel(chat.LastSenderName) + ": " + preview
+	}
+	timestamp := ""
+	if !chat.LastMessageAt.IsZero() {
+		timestamp = formatRelativeTime(chat.LastMessageAt, time.Now())
+	}
+	timeRendered := subtleStyle.Render(timestamp)
+	previewMax := contentWidth - lipgloss.Width(timeRendered) - 1
+	if previewMax < 4 {
+		previewMax = 4
+	}
+	preview = truncateText(preview, previewMax)
+	previewRendered := mutedStyle.Render(preview)
+	botGap := max(1, contentWidth-lipgloss.Width(previewRendered)-lipgloss.Width(timeRendered))
+	botLine := "  " + previewRendered + strings.Repeat(" ", botGap) + timeRendered
+
+	// Defensive clamp: every item must be exactly two visible lines. If any
+	// upstream styled segment ever emits an embedded newline, drop the tail.
+	return clampToLines(topLine+"\n"+botLine, 2)
+}
+
+func clampToLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	parts := strings.Split(s, "\n")
+	if len(parts) <= n {
+		return s
+	}
+	return strings.Join(parts[:n], "\n")
+}
+
+func formatRelativeTime(t, now time.Time) string {
+	t = t.Local()
+	now = now.Local()
+	d := now.Sub(t)
+	if d < 0 {
+		return t.Format("15:04")
+	}
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case sameDay(t, now):
+		return t.Format("15:04")
+	case sameDay(t.AddDate(0, 0, 1), now):
+		return "yest"
+	case d < 7*24*time.Hour:
+		return t.Format("Mon")
+	case t.Year() == now.Year():
+		return t.Format("Jan 2")
+	default:
+		return t.Format("Jan '06")
+	}
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
+}
+
+func (m Model) chatPreviewBody(width, height int) string {
 	width = max(18, width)
+	height = max(1, height)
 	chat := m.currentChat()
 	if chat == nil {
-		return wrapText("Select a chat to inspect it.", width)
+		return slateStyle.Render(wrapText("Select a chat to inspect it.", width))
 	}
 
-	title := truncateText(chat.Title, width)
-	jid := truncateText(chat.JID, width)
+	title := truncateText(displayChatTitle(*chat), width)
 	lastPreview := strings.TrimSpace(chat.LastMessagePreview)
 	if lastPreview == "" {
 		lastPreview = "No messages yet"
 	}
+	fixedLines := 12
+	if !chat.LastMessageAt.IsZero() {
+		fixedLines++
+	}
+	if chat.LastSenderName != "" {
+		fixedLines += 2
+	}
+	previewLines := min(6, max(1, height-fixedLines))
+	preview := limitTextLines(wrapText(lastPreview, width), previewLines)
 	lines := []string{
 		titleStyle.Render(title),
-		mutedStyle.Render(jid),
 		"",
-		fmt.Sprintf("Unread: %d", chat.UnreadCount),
-		fmt.Sprintf("Type: %s", chatType(chat.IsGroup)),
+		smallCap("Detail", width),
+		metaRow("Type", chatType(chat.IsGroup), width),
+		metaRow("Unread", fmt.Sprintf("%d", chat.UnreadCount), width),
 	}
 	if !chat.LastMessageAt.IsZero() {
-		lines = append(lines, fmt.Sprintf("Last activity: %s", chat.LastMessageAt.Local().Format("Mon 02 Jan 15:04")))
+		lines = append(lines, metaRow("Last", chat.LastMessageAt.Local().Format("Jan 2 15:04"), width))
 	}
 	lines = append(lines,
 		"",
-		metaStyle.Render("Latest preview"),
-		bodyStyle.Render(wrapText(lastPreview, width)),
+		smallCap("Latest preview", width),
+		bodyStyle.Render(preview),
 	)
 	if chat.LastSenderName != "" {
-		lines = append(lines, mutedStyle.Render(wrapText("Last sender: "+chat.LastSenderName, width)))
+		lines = append(lines, "", subtleStyle.Render(wrapText("— "+displaySenderLabel(chat.LastSenderName), width)))
 	}
 	lines = append(lines,
 		"",
-		metaStyle.Render("Actions"),
-		mutedStyle.Render(wrapText("Enter opens the thread", width)),
-		mutedStyle.Render(wrapText("/ filters the list", width)),
-		mutedStyle.Render(wrapText("r reloads cached chats", width)),
+		smallCap("Actions", width),
+		actionRow("↵", "open thread", width),
+		actionRow("/", "filter inbox", width),
+		actionRow("r", "reload cache", width),
 	)
-	return strings.Join(lines, "\n")
+	return limitTextLines(strings.Join(lines, "\n"), height)
+}
+
+func smallCap(label string, width int) string {
+	// Keep a right-side margin so styled Unicode rule rows never sit flush with
+	// the panel edge. Lipgloss can wrap near-boundary styled runs, which leaves
+	// stray vertical border fragments in no-alt-screen terminals.
+	rule := strings.Repeat("─", max(0, width-lipgloss.Width(label)-smallCapRuleMargin))
+	return sectionStyle.Render(label) + "  " + hairlineStyle.Render(rule)
+}
+
+func metaRow(label, value string, width int) string {
+	limit := max(4, width-2-lipgloss.Width(label)-2)
+	value = truncateText(value, limit)
+	return subtleStyle.Render(label) + "  " + slateStyle.Render(value)
+}
+
+func actionRow(key, label string, width int) string {
+	chip := subtleStyle.Render("[") + chipKeyStyle.Render(key) + subtleStyle.Render("]")
+	rest := chipLabelStyle.Render(label)
+	line := chip + " " + rest
+	if lipgloss.Width(line) > width {
+		return truncateText(line, width)
+	}
+	return line
 }
 
 func (m Model) threadBody(messageHeight, width int) string {
@@ -1210,22 +1837,34 @@ func (m Model) threadBody(messageHeight, width int) string {
 		if name == "" {
 			name = msg.SenderJID
 		}
-		if msg.FromMe {
+		var nameStyle lipgloss.Style
+		switch {
+		case msg.FromMe:
 			name = "You"
+			nameStyle = youNameStyle
+		case msg.IsGroup:
+			nameStyle = memberNameStyle
+		default:
+			nameStyle = peerNameStyle
 		}
-		header := truncateText(fmt.Sprintf("%s  %s", msg.Timestamp.Local().Format(time.Kitchen), name), width)
+		stamp := timestampStyle.Render(msg.Timestamp.Local().Format("15:04"))
+		who := nameStyle.Render(truncateText(name, max(8, width-10)))
+		header := stamp + "  " + who
 		body := wrapText(msg.Text, width)
-		text := fmt.Sprintf("%s\n%s%s", metaStyle.Render(header), bodyStyle.Render(body), receiptSuffix(msg))
+		text := header + "\n" + bodyStyle.Render(body)
+		if suffix := receiptSuffix(msg); suffix != "" {
+			text += "\n" + strings.TrimSpace(suffix)
+		}
 		if msg.DownloadedPath != "" {
-			text += "\n" + mutedStyle.Render("saved: "+filepath.Base(msg.DownloadedPath))
+			text += "\n" + subtleStyle.Render("↳ saved · "+filepath.Base(msg.DownloadedPath))
 		}
 		rendered = append(rendered, renderedMessage{text: text, lines: countRenderedLines(text)})
 	}
 	if len(rendered) == 0 {
 		if m.threadHistoryPending {
-			return mutedStyle.Render("Requesting messages for this chat from your phone...")
+			return slateStyle.Render("Requesting messages for this chat from your phone…")
 		}
-		return mutedStyle.Render("No cached messages for this chat yet.")
+		return slateStyle.Render("No cached messages for this chat yet.")
 	}
 
 	selected := make([]string, 0, len(rendered))
@@ -1263,7 +1902,13 @@ func (m Model) composerBody(width int) string {
 		}
 		return strings.Join(body, "\n")
 	}
-	return mutedStyle.Render("Press i to compose. Use the + button or Ctrl+O for files, Ctrl+V for a screenshot, or Alt+V for a voice note.")
+	parts := []string{
+		subtleStyle.Render("[") + chipKeyStyle.Render("i") + subtleStyle.Render("]") + " " + chipLabelStyle.Render("compose"),
+		subtleStyle.Render("[") + chipKeyStyle.Render("ctrl+o") + subtleStyle.Render("]") + " " + chipLabelStyle.Render("files"),
+		subtleStyle.Render("[") + chipKeyStyle.Render("ctrl+v") + subtleStyle.Render("]") + " " + chipLabelStyle.Render("screenshot"),
+		subtleStyle.Render("[") + chipKeyStyle.Render("alt+v") + subtleStyle.Render("]") + " " + chipLabelStyle.Render("voice"),
+	}
+	return strings.Join(parts, subtleStyle.Render("   "))
 }
 
 func (m *Model) resizeComposer(width, maxHeight int) {
@@ -1272,7 +1917,7 @@ func (m *Model) resizeComposer(width, maxHeight int) {
 	}
 	m.composer.SetWidth(max(12, width))
 	inputWidth := max(8, width-len([]rune(m.composer.Prompt)))
-	targetHeight := clampComposerHeight(wrappedDraftLineCount(m.composer.Value(), inputWidth)+1, maxHeight)
+	targetHeight := clampComposerHeight(composerHeightForDraft(m.composer.Value(), inputWidth), maxHeight)
 	m.composer.SetHeight(targetHeight)
 }
 
@@ -1288,7 +1933,7 @@ func (m *Model) nextVoicePlaceholder() string {
 
 func (m *Model) clearPendingAttachments() {
 	for _, attachment := range m.pendingAttachments {
-		if attachment.path != "" {
+		if attachment.temp && attachment.path != "" {
 			_ = os.Remove(attachment.path)
 		}
 	}
@@ -1297,36 +1942,33 @@ func (m *Model) clearPendingAttachments() {
 	m.nextVoiceID = 0
 }
 
-func (m *Model) insertComposerText(text string) {
-	m.composer.InsertString(text)
-}
-
 func (m Model) renderComposeToolbar(width int) string {
-	attach := toolbarButtonStyle.Render("+")
-	voiceLabel := "mic"
+	attach := toolbarButtonStyle.Render(" + ")
+	voiceLabel := " ◉ mic "
 	voiceStyle := toolbarButtonStyle
 	if m.recordingVoice || m.stoppingVoice {
-		voiceLabel = "play"
+		voiceLabel = " ● rec "
 		voiceStyle = toolbarActiveButtonStyle
 	}
 	voice := voiceStyle.Render(voiceLabel)
-	hint := "enter to queue message"
+	hint := "↵ queue"
 	if m.filePickerOpen {
-		hint = "j/k move  enter select  h up  esc close"
+		hint = "j/k move · ↵ select · h up · esc close"
 	} else if m.recordingVoice {
-		hint = "recording voice note"
+		hint = "recording voice note…"
 	}
-	line := lipgloss.JoinHorizontal(lipgloss.Left, attach, " ", voice, " ", mutedStyle.Render(truncateText(hint, max(10, width-12))))
+	hintRendered := slateStyle.Render(truncateText(hint, max(10, width-lipgloss.Width(attach)-lipgloss.Width(voice)-4)))
+	line := lipgloss.JoinHorizontal(lipgloss.Left, attach, " ", voice, "  ", hintRendered)
 	return lipgloss.NewStyle().MaxWidth(max(12, width)).Render(line)
 }
 
 func (m Model) renderFilePicker(width int) string {
 	width = max(18, width)
 	lines := []string{
-		metaStyle.Render(truncateText("Files · "+m.filePickerDir, width)),
+		smallCap("Files · "+truncateText(m.filePickerDir, max(8, width-10)), width),
 	}
 	if len(m.filePickerEntries) == 0 {
-		lines = append(lines, mutedStyle.Render("No files here"))
+		lines = append(lines, subtleStyle.Render("  (empty)"))
 		return strings.Join(lines, "\n")
 	}
 	limit := min(5, len(m.filePickerEntries))
@@ -1341,13 +1983,12 @@ func (m Model) renderFilePicker(width int) string {
 		if entry.isDir {
 			label += string(os.PathSeparator)
 		}
-		line := "  " + truncateText(label, width-2)
-		style := mutedStyle
+		label = truncateText(label, width-2)
 		if idx == m.filePickerSelected {
-			line = "› " + truncateText(label, width-2)
-			style = selectedItemStyle
+			lines = append(lines, railStyle.Render("▌")+" "+selectedItemStyle.Render(label))
+		} else {
+			lines = append(lines, "  "+mutedStyle.Render(label))
 		}
-		lines = append(lines, style.Render(line))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1391,7 +2032,7 @@ func (m Model) pickSelectedFileEntry() (tea.Model, tea.Cmd) {
 		m.filePickerDir = entry.path
 		m.filePickerSelected = 0
 		m.refreshFilePicker()
-		return m, m.redrawCmd()
+		return m, nil
 	}
 	kind := media.KindForPath(entry.path)
 	token := media.AttachmentToken(filepath.Base(entry.path), kind)
@@ -1413,24 +2054,24 @@ func (m Model) toggleVoiceRecording() (tea.Model, tea.Cmd) {
 	}
 	if m.recordingVoice {
 		if time.Since(m.recordingSince) < 600*time.Millisecond {
-			return m, m.redrawCmd()
+			return m, nil
 		}
 		m.stoppingVoice = true
 		m.recordingVoice = false
-		return m, tea.Batch(m.redrawCmd(), stopVoiceRecordingCmd(m.recorder, m.nextVoicePlaceholder()))
+		return m, stopVoiceRecordingCmd(m.recorder, m.nextVoicePlaceholder())
 	}
 	if m.recorder == nil {
 		m.lastErr = "voice recorder is unavailable"
-		return m, m.redrawCmd()
+		return m, nil
 	}
 	if err := m.recorder.Start(); err != nil {
 		m.lastErr = err.Error()
-		return m, m.redrawCmd()
+		return m, nil
 	}
 	m.recordingVoice = true
 	m.recordingSince = time.Now()
 	m.lastErr = ""
-	return m, m.redrawCmd()
+	return m, nil
 }
 
 func (m *Model) clearPathSuggestions() {
@@ -1463,24 +2104,24 @@ func (m Model) renderPathSuggestions(width int) string {
 	if len(m.pathSuggestions) == 0 {
 		return ""
 	}
-	lines := []string{metaStyle.Render("Paths · tab apply · ctrl+n / ctrl+p navigate")}
+	var heading string
+	switch {
+	case m.pathSuggestionFocus:
+		heading = "Paths · j/k move · enter/tab apply · esc return"
+	default:
+		heading = "Paths · tab focus list · keep typing to refine"
+	}
+	lines := []string{smallCap(heading, width)}
 	for idx, suggestion := range m.pathSuggestions {
-		label := truncateText(suggestion.label, max(12, width))
+		label := truncateText(suggestion.label, max(12, width-2))
 		if suggestion.isDir {
 			label += string(os.PathSeparator)
 		}
-		line := "  " + label
-		style := mutedStyle
 		if idx == m.pathSuggestionIdx {
-			line = "› " + label
-			style = selectedItemStyle
+			lines = append(lines, railStyle.Render("▌")+" "+selectedItemStyle.Render(label))
+		} else {
+			lines = append(lines, "  "+mutedStyle.Render(label))
 		}
-		lines = append(lines, style.Render(line))
-	}
-	if m.pathSuggestionFocus {
-		lines[0] = metaStyle.Render("Paths · j/k move · enter/tab apply · esc return")
-	} else {
-		lines[0] = metaStyle.Render("Paths · tab focus list · keep typing to refine")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1580,22 +2221,17 @@ func filePathSuggestions(raw string, limit int) []pathSuggestion {
 }
 
 func (m Model) threadToolbarHit(x, y int) string {
-	contentWidth := max(48, m.width-2)
-	header := m.renderHeader(m.threadTitle(), "")
-	footer := m.renderFooter(m.threadHelpText())
-	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
-	composerContent := m.composerBody(contentWidth - boxMutedStyle.GetHorizontalFrameSize())
-	composerHeight := max(3, countRenderedLines(composerContent)+boxMutedStyle.GetVerticalFrameSize())
-	messageHeight := max(8, bodyHeight-composerHeight)
-	composerTop := countRenderedLines(header) + messageHeight
-	toolbarY := composerTop + 1
+	layout := m.threadLayout()
+	// The toolbar is the first content row inside the composer panel: one
+	// past the panel's top border.
+	toolbarY := layout.headerLines + layout.messageHeight + 1
 	contentX := boxMutedStyle.GetPaddingLeft() + 1
 	if y != toolbarY || x < contentX {
 		return ""
 	}
 	relativeX := x - contentX
 	switch {
-	case relativeX >= 0 && relativeX <= 2:
+	case relativeX <= 2:
 		return "attach"
 	case relativeX >= 4 && relativeX <= 10:
 		return "voice"
@@ -1756,39 +2392,120 @@ func chatType(isGroup bool) string {
 	return "direct"
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
+// renderPanel renders content inside a fixed-size box. The box dimensions
+// come from the window layout alone — content can never grow or shrink it.
+// Every content line is hard-clipped to the panel's inner width (so lipgloss
+// never re-wraps anything) and the line count is clamped and padded to the
+// inner height.
 func renderPanel(style lipgloss.Style, totalWidth, totalHeight int, content string) string {
 	totalWidth = max(style.GetHorizontalFrameSize()+1, totalWidth)
 	totalHeight = max(style.GetVerticalFrameSize()+1, totalHeight)
-	return style.Width(totalWidth - style.GetHorizontalFrameSize()).Height(totalHeight - style.GetVerticalFrameSize()).Render(content)
+	innerWidth := totalWidth - style.GetHorizontalFrameSize()
+	innerHeight := totalHeight - style.GetVerticalFrameSize()
+
+	lines := strings.Split(content, "\n")
+	if len(lines) > innerHeight {
+		lines = lines[:innerHeight]
+	}
+	for i, line := range lines {
+		if ansi.StringWidth(line) > innerWidth {
+			lines[i] = ansi.Truncate(line, innerWidth, "")
+		}
+	}
+	for len(lines) < innerHeight {
+		lines = append(lines, "")
+	}
+	// Width excludes the border in lipgloss, so totalWidth-border yields a
+	// text area of exactly innerWidth and a rendered block of totalWidth.
+	return style.Width(totalWidth - style.GetHorizontalBorderSize()).Render(strings.Join(lines, "\n"))
 }
 
+func limitTextLines(text string, maxLines int) string {
+	if maxLines <= 0 || text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) <= maxLines {
+		return text
+	}
+	return strings.Join(lines[:maxLines], "\n")
+}
+
+func (m Model) fitFrame(view string) string {
+	if m.width <= 0 || m.height <= 0 || view == "" {
+		return view
+	}
+	// Leave the final terminal column untouched. Any line that reaches the final
+	// column can trigger autowrap before Bubble Tea appends its clear-to-EOL
+	// sequence, which desynchronizes no-alt-screen redraws while scrolling.
+	targetWidth := max(1, m.width-1)
+	lines := strings.Split(view, "\n")
+	if len(lines) > m.height {
+		lines = lines[:m.height]
+	}
+	for len(lines) < m.height {
+		lines = append(lines, "")
+	}
+	for idx, line := range lines {
+		lines[idx] = ansi.Truncate(line, targetWidth, "")
+		if m.forceRepaint {
+			lines[idx] += repaintMarker(m.frameNonce)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func repaintMarker(n int) string {
+	if n%2 == 0 {
+		return "\x1b[0m"
+	}
+	return "\x1b[00m"
+}
+
+// truncateText shortens text to the given display width, appending an
+// ellipsis when anything was cut. It measures visual cells (not runes) so
+// wide characters and emoji cannot overflow panels, and it is safe on
+// styled input: ANSI escape sequences are preserved, never split.
 func truncateText(text string, width int) string {
 	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(text)
-	if len(runes) <= width {
+	if ansi.StringWidth(text) <= width {
 		return text
 	}
 	if width == 1 {
 		return "…"
 	}
-	return string(runes[:width-1]) + "…"
+	return ansi.Truncate(text, width, "…")
+}
+
+// truncateTextHead is truncateText's mirror image: it keeps the tail of the
+// text and elides the head. Intended for plain (unstyled) strings such as the
+// live search query.
+func truncateTextHead(text string, width int) string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(text) <= width {
+		return text
+	}
+	if width == 1 {
+		return "…"
+	}
+	runes := []rune(text)
+	used := 0
+	start := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		w := ansi.StringWidth(string(runes[i]))
+		if used+w > width-1 {
+			break
+		}
+		used += w
+		start = i
+	}
+	return "…" + string(runes[start:])
 }
 
 func wrapText(text string, width int) string {
@@ -1805,21 +2522,23 @@ func wrapText(text string, width int) string {
 		}
 		var current string
 		for _, word := range strings.Fields(paragraph) {
-			if current == "" {
-				current = word
-				continue
-			}
-			if len([]rune(current))+1+len([]rune(word)) <= width {
-				current += " " + word
-				continue
-			}
-			lines = append(lines, current)
-			if len([]rune(word)) > width {
+			switch {
+			case ansi.StringWidth(word) > width:
+				// A single word wider than the panel (URLs, hashes) is
+				// clipped — it must never leak through and re-wrap.
+				if current != "" {
+					lines = append(lines, current)
+					current = ""
+				}
 				lines = append(lines, truncateText(word, width))
-				current = ""
-				continue
+			case current == "":
+				current = word
+			case ansi.StringWidth(current)+1+ansi.StringWidth(word) <= width:
+				current += " " + word
+			default:
+				lines = append(lines, current)
+				current = word
 			}
-			current = word
 		}
 		if current != "" {
 			lines = append(lines, current)
@@ -1835,28 +2554,36 @@ func countRenderedLines(text string) int {
 	return len(strings.Split(text, "\n"))
 }
 
-func wrappedDraftLineCount(text string, width int) int {
-	if width <= 0 {
+// composerHeightForDraft returns how many rows the textarea needs to show
+// the draft and its cursor: the wrapped line count, plus one extra row when
+// the last visual row is exactly full (the cursor then sits on the next row).
+// An empty draft needs a single row — one prompt arrow, not three.
+func composerHeightForDraft(text string, width int) int {
+	if width <= 0 || text == "" {
 		return 1
 	}
-	lines := 0
-	for _, line := range strings.Split(text, "\n") {
-		runes := len([]rune(line))
-		if runes == 0 {
-			lines++
+	lines := strings.Split(text, "\n")
+	total := 0
+	for _, line := range lines {
+		cells := ansi.StringWidth(line)
+		if cells == 0 {
+			total++
 			continue
 		}
-		lines += (runes-1)/width + 1
+		total += (cells-1)/width + 1
 	}
-	return max(1, lines)
+	if last := ansi.StringWidth(lines[len(lines)-1]); last > 0 && last%width == 0 {
+		total++
+	}
+	return max(1, total)
 }
 
 func clampComposerHeight(lines, maxHeight int) int {
-	if maxHeight < 3 {
-		maxHeight = 3
+	if maxHeight < 1 {
+		maxHeight = 1
 	}
-	if lines < 3 {
-		return 3
+	if lines < 1 {
+		return 1
 	}
 	if lines > maxHeight {
 		return maxHeight
@@ -1918,19 +2645,45 @@ func parseImageCommand(input string) (string, string, error) {
 	return path, caption, nil
 }
 
+// Theme-driven styles. Assigned by applyTheme; see internal/ui/theme.go.
 var (
-	titleStyle               = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69"))
-	mutedStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	errorStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("204"))
-	itemStyle                = lipgloss.NewStyle()
-	selectedItemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
-	metaStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-	bodyStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	toolbarButtonStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238")).Padding(0, 1)
-	toolbarActiveButtonStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("34")).Padding(0, 1)
-	boxStyle                 = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62")).Padding(1, 2)
-	boxMutedStyle            = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 2)
-	qrBoxStyle               = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62")).Padding(1, 2)
-	headerStyle              = lipgloss.NewStyle().Padding(0, 1)
-	footerStyle              = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
+	currentTheme Theme
+
+	titleStyle               lipgloss.Style
+	brandStyle               lipgloss.Style
+	mutedStyle               lipgloss.Style
+	slateStyle               lipgloss.Style
+	subtleStyle              lipgloss.Style
+	hairlineStyle            lipgloss.Style
+	errorStyle               lipgloss.Style
+	selectedItemStyle        lipgloss.Style
+	railStyle                lipgloss.Style
+	sectionStyle             lipgloss.Style
+	bodyStyle                lipgloss.Style
+	peerNameStyle            lipgloss.Style
+	youNameStyle             lipgloss.Style
+	memberNameStyle          lipgloss.Style
+	timestampStyle           lipgloss.Style
+	receiptReadStyle         lipgloss.Style
+	receiptDeliveredStyle    lipgloss.Style
+	receiptSentStyle         lipgloss.Style
+	unreadPillStyle          lipgloss.Style
+	chipKeyStyle             lipgloss.Style
+	chipLabelStyle           lipgloss.Style
+	statusDotOnStyle         lipgloss.Style
+	statusDotWarnStyle       lipgloss.Style
+	statusDotErrStyle        lipgloss.Style
+	toolbarButtonStyle       lipgloss.Style
+	toolbarActiveButtonStyle lipgloss.Style
+	boxStyle                 lipgloss.Style
+	boxMutedStyle            lipgloss.Style
+	qrBoxStyle               lipgloss.Style
+
+	// Layout-only styles (theme-independent).
+	headerStyle = lipgloss.NewStyle().Padding(0, 1)
+	footerStyle = lipgloss.NewStyle().Padding(0, 1)
 )
+
+func init() {
+	applyTheme(DefaultTheme())
+}

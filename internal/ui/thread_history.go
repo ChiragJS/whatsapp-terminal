@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"github.com/charmbracelet/bubbletea"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/chirag/whatsapp-terminal/internal/domain"
 )
@@ -26,7 +26,7 @@ func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
 	if !stateChanged {
 		return m, nil
 	}
-	return m, batchCommands(m.redrawCmd(), cmd)
+	return m, cmd
 }
 
 func (m Model) loadOlderThreadMessages() (Model, tea.Cmd) {

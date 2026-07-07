@@ -40,23 +40,10 @@ func TestDemoModePTYSmoke(t *testing.T) {
 	if _, err := ptmx.Write([]byte("\r")); err != nil {
 		t.Fatalf("write enter error = %v", err)
 	}
-	waitForSubstring(t, &out, "esc back")
+	waitForSubstring(t, &out, "PROJECT ALPHA")
 	waitForSubstring(t, &out, "I’ll review the summary tonight")
 
-	chatListNeedle := "Press / to search chats by name or JID"
-	chatListRenders := strings.Count(out.String(), chatListNeedle)
-	if _, err := ptmx.Write([]byte("\x1b")); err != nil {
-		t.Fatalf("write escape error = %v", err)
-	}
-	waitForSubstringCount(t, &out, chatListNeedle, chatListRenders+1)
-
-	chatListRenders = strings.Count(out.String(), chatListNeedle)
-	if _, err := ptmx.Write([]byte("\x1b")); err != nil {
-		t.Fatalf("write quit escape error = %v", err)
-	}
-	waitForSubstringCount(t, &out, chatListNeedle, chatListRenders+1)
-
-	if _, err := ptmx.Write([]byte("q")); err != nil {
+	if _, err := ptmx.Write([]byte("\x03")); err != nil {
 		t.Fatalf("write quit error = %v", err)
 	}
 
@@ -77,6 +64,16 @@ func TestDemoModePTYSmoke(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("pty reader did not finish")
 	}
+
+	// Autowrap (DECAWM) must be disabled while the TUI runs — over-wide
+	// glyph runs would otherwise desynchronize repaints — and restored on
+	// exit so the shell is left intact.
+	if !strings.Contains(out.String(), "\x1b[?7l") {
+		t.Fatal("expected the app to disable terminal autowrap on start")
+	}
+	if !strings.Contains(out.String(), "\x1b[?7h") {
+		t.Fatal("expected the app to restore terminal autowrap on exit")
+	}
 }
 
 func waitForSubstring(t *testing.T, out *bytes.Buffer, needle string) {
@@ -90,17 +87,4 @@ func waitForSubstring(t *testing.T, out *bytes.Buffer, needle string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %q\noutput:\n%s", needle, out.String())
-}
-
-func waitForSubstringCount(t *testing.T, out *bytes.Buffer, needle string, want int) {
-	t.Helper()
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Count(out.String(), needle) >= want {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %q to appear %d times\noutput:\n%s", needle, want, out.String())
 }

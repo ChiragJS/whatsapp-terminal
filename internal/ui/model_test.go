@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -216,6 +218,335 @@ func TestChatListViewFitsTerminalWidth(t *testing.T) {
 	}
 }
 
+func TestDisplayChatTitleMasksJIDShapedGroupTitles(t *testing.T) {
+	t.Parallel()
+
+	chat := domain.ChatSummary{
+		JID:     "120363405662701156@g.us",
+		Title:   "120363405662701156",
+		IsGroup: true,
+	}
+	if got := displayChatTitle(chat); got != "Unnamed group · …1156" {
+		t.Fatalf("displayChatTitle() = %q, want friendly unknown group label", got)
+	}
+
+	chat.Title = chat.JID
+	if got := displayChatTitle(chat); got != "Unnamed group · …1156" {
+		t.Fatalf("displayChatTitle(full JID) = %q, want friendly unknown group label", got)
+	}
+}
+
+func TestDisplayChatTitleCollapsesEmbeddedNewlines(t *testing.T) {
+	t.Parallel()
+
+	chat := domain.ChatSummary{
+		JID:   "120363405662701156@g.us",
+		Title: "Coding Club 2023-2024\nBidadi Boys 2024.",
+	}
+	got := displayChatTitle(chat)
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Fatalf("displayChatTitle() = %q, must not contain newlines/tabs", got)
+	}
+	if got != "Coding Club 2023-2024 Bidadi Boys 2024." {
+		t.Fatalf("displayChatTitle() = %q, want collapsed single line", got)
+	}
+}
+
+func TestDisplayChatTitleHandlesUnknownServerAndStrippedSuffix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		chat domain.ChatSummary
+		want string
+	}{
+		{
+			name: "long digit title with @g.us jid that doesn't exactly match",
+			chat: domain.ChatSummary{JID: "207485927428170@g.us", Title: "207485927428170 "}, // trailing whitespace
+			want: "Unnamed group · …8170",
+		},
+		{
+			name: "long digit title with @lid jid (linked id)",
+			chat: domain.ChatSummary{JID: "53210366615785@lid", Title: "53210366615785"},
+			want: "Linked contact · …5785",
+		},
+		{
+			name: "long digit title with bare-digit jid (no @ at all)",
+			chat: domain.ChatSummary{JID: "143263080181835", Title: "143263080181835"},
+			want: "Unknown contact · …1835",
+		},
+		{
+			name: "long digit title on direct chat masks phone number",
+			chat: domain.ChatSummary{JID: "919160001284@s.whatsapp.net", Title: "120229036318754"},
+			want: "Unknown contact · …1284",
+		},
+		{
+			name: "redacted phone-like title on direct chat masks phone number",
+			chat: domain.ChatSummary{JID: "917619531904@s.whatsapp.net", Title: "+91∙∙∙∙∙∙∙∙04"},
+			want: "Unknown contact · …1904",
+		},
+		{
+			name: "normal direct chat title is preserved",
+			chat: domain.ChatSummary{JID: "alice@s.whatsapp.net", Title: "Alice Mercer"},
+			want: "Alice Mercer",
+		},
+		{
+			name: "short numeric title (could be initials) is preserved",
+			chat: domain.ChatSummary{JID: "g@g.us", Title: "2024"},
+			want: "2024",
+		},
+	}
+	for _, tc := range cases {
+		if got := displayChatTitle(tc.chat); got != tc.want {
+			t.Errorf("%s: displayChatTitle() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestDisplaySenderLabelMasksDigitSenders(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"real name kept", "Bob Chen", "Bob Chen"},
+		{"digit-only sender (15 digits)", "234273336496234", "…6234"},
+		{"digit-only with whitespace", "  155168645603548\n", "…3548"},
+		{"full JID with digit user", "232121910177920@s.whatsapp.net", "…7920"},
+		{"redacted phone-like sender", "+91∙∙∙∙∙∙∙∙04", "…9104"},
+		{"empty", "", ""},
+		{"short digit run is left alone (could be a username)", "1234", "1234"},
+	}
+	for _, tc := range cases {
+		if got := displaySenderLabel(tc.in); got != tc.want {
+			t.Errorf("%s: displaySenderLabel(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDumpChatListDiagnosticsEmitsPerChatRecords(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(handler)
+
+	m := Model{
+		logger: logger,
+		chats: []domain.ChatSummary{
+			{JID: "alice@s.whatsapp.net", Title: "Alice Mercer"},
+			{JID: "120363405662701156@g.us", Title: "120363405662701156", IsGroup: true, LastSenderName: "234273336496234"},
+		},
+	}
+	m.dumpChatListDiagnostics()
+	out := buf.String()
+
+	for _, needle := range []string{
+		"ui:dump.begin",
+		"ui:dump.chat",
+		"ui:dump.end",
+		`jid=alice@s.whatsapp.net`,
+		`display_title="Alice Mercer"`,
+		`jid=120363405662701156@g.us`,
+		`display_title="Unnamed group · …1156"`,
+		`display_sender=…6234`,
+	} {
+		if !strings.Contains(out, needle) {
+			t.Errorf("dump log missing %q\nfull output:\n%s", needle, out)
+		}
+	}
+}
+
+func TestRenderFooterHasStableThreeLineHeight(t *testing.T) {
+	t.Parallel()
+
+	m := Model{width: 80}
+	withoutErr := m.renderFooter("j/k move  enter open")
+	m.lastErr = "database is locked"
+	withErr := m.renderFooter("j/k move  enter open")
+	if got := countRenderedLines(withoutErr); got != 3 {
+		t.Fatalf("footer without error = %d lines, want 3:\n%s", got, withoutErr)
+	}
+	if got := countRenderedLines(withErr); got != 3 {
+		t.Fatalf("footer with error = %d lines, want 3:\n%s", got, withErr)
+	}
+}
+
+func TestRenderChatItemAlwaysProducesExactlyTwoLines(t *testing.T) {
+	t.Parallel()
+
+	cases := []domain.ChatSummary{
+		{JID: "alice@s.whatsapp.net", Title: "Alice", LastMessagePreview: "hi"},
+		{JID: "g@g.us", Title: "Multi\nLine\nTitle\nHere", LastMessagePreview: "preview\nwith\nnewlines", IsGroup: true},
+		{JID: "120363@g.us", Title: "", LastMessagePreview: "", IsGroup: true, UnreadCount: 7},
+		{JID: "120363@g.us", Title: "120363", LastMessagePreview: "x", IsGroup: true, UnreadCount: 250},
+	}
+	for i, chat := range cases {
+		out := renderChatItem(chat, 40, i == 1)
+		if got := countRenderedLines(out); got != 2 {
+			t.Fatalf("case %d: renderChatItem produced %d lines, want 2:\n%s", i, got, out)
+		}
+	}
+}
+
+func TestRenderChatItemMasksUnknownDirectPhoneArtifacts(t *testing.T) {
+	t.Parallel()
+
+	chat := domain.ChatSummary{
+		JID:                "919160001284@s.whatsapp.net",
+		Title:              "120229036318754",
+		LastSenderName:     "120229036318754",
+		LastMessagePreview: "[unsupported message]",
+		UnreadCount:        2,
+	}
+	out := renderChatItem(chat, 48, true)
+	if !strings.Contains(out, "Unknown contact · …1284") {
+		t.Fatalf("renderChatItem() missing masked contact label:\n%s", out)
+	}
+	for _, forbidden := range []string{"120229036318754", "+919160001284"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("renderChatItem() leaked %q:\n%s", forbidden, out)
+		}
+	}
+}
+
+func TestChatListNavigationDoesNotRecenterWithinVisiblePage(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 32
+	m.ready = true
+	m.chats = makeChatSummaries(20)
+
+	for i := 0; i < 5; i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = updated.(Model)
+	}
+
+	if m.selected != 5 {
+		t.Fatalf("selected = %d, want 5", m.selected)
+	}
+	view := m.View()
+	assertViewFitsWidth(t, view, m.width)
+	assertViewFitsHeight(t, view, m.height)
+	if !strings.Contains(view, "Chat 00") {
+		t.Fatalf("viewport recentered before selected left the first page:\n%s", view)
+	}
+	if !strings.Contains(view, "Chat 05") {
+		t.Fatalf("view missing selected chat:\n%s", view)
+	}
+}
+
+func TestChatPreviewCapsLongLatestPreview(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.chats = []domain.ChatSummary{{
+		JID:                "long-preview@s.whatsapp.net",
+		Title:              "Long Preview",
+		LastMessagePreview: strings.Repeat("This preview is intentionally long and should not consume the whole side pane. ", 20),
+		LastMessageAt:      time.Date(2026, 4, 5, 18, 0, 0, 0, time.UTC),
+	}}
+
+	body := m.chatPreviewBody(54, 16)
+	if lines := countRenderedLines(body); lines > 16 {
+		t.Fatalf("preview body lines = %d, want <= 16:\n%s", lines, body)
+	}
+	if !strings.Contains(body, "Actions") {
+		t.Fatalf("preview body lost actions after capping long preview:\n%s", body)
+	}
+}
+
+func TestViewFramesAvoidAutowrapColumn(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.chats = makeChatSummaries(20)
+
+	first := m.View()
+	assertViewAvoidsAutowrapColumn(t, first, m.width, m.height)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+	second := m.View()
+	assertViewAvoidsAutowrapColumn(t, second, m.width, m.height)
+}
+
+func TestForceRepaintChangesRawFrameWithoutChangingVisibleFrame(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)}).WithForceRepaint(true)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.chats = makeChatSummaries(20)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+	first := m.View()
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = updated.(Model)
+	second := m.View()
+
+	if first == second {
+		t.Fatal("raw frames are identical; expected repaint marker to force redraw")
+	}
+	if ansiPattern.ReplaceAllString(first, "") != ansiPattern.ReplaceAllString(second, "") {
+		t.Fatalf("visible frames differ after equivalent selection:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+func TestSmallCapLeavesRightEdgeSafetyMargin(t *testing.T) {
+	t.Parallel()
+
+	const width = 54
+	for _, label := range []string{"Detail", "Latest preview", "Actions"} {
+		line := smallCap(label, width)
+		if got, maxWidth := lipgloss.Width(line), width-3; got > maxWidth {
+			t.Fatalf("smallCap(%q) width = %d, want <= %d", label, got, maxWidth)
+		}
+	}
+}
+
+func TestThreadLongMessageReceiptDoesNotOverflowPanel(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.chats = []domain.ChatSummary{{JID: "project-alpha@g.us", Title: "Project Alpha", IsGroup: true}}
+	m.messages = []domain.Message{{
+		ID:        "long-1",
+		ChatJID:   "project-alpha@g.us",
+		SenderJID: "self@s.whatsapp.net",
+		Text: strings.Repeat(
+			"But your doesn't depend on it, tu ubi ka end product dekh raha, the foundations are done already. ",
+			4,
+		),
+		Timestamp: time.Date(2026, 4, 5, 18, 0, 0, 0, time.UTC),
+		FromMe:    true,
+		Receipt:   domain.ReceiptStateRead,
+		IsGroup:   true,
+	}}
+
+	view := m.View()
+	assertViewFitsWidth(t, view, m.width)
+	assertViewFitsHeight(t, view, m.height)
+}
+
 func TestThreadViewFitsTerminalWidthWhileComposing(t *testing.T) {
 	t.Parallel()
 
@@ -275,7 +606,7 @@ func TestSearchFiltersChatList(t *testing.T) {
 	m.searching = true
 	m.search.SetValue("alice")
 
-	msg := loadChatsCmd(repo, "alice")()
+	msg := loadChatsCmd(repo, "alice", 0)()
 	updated, _ := m.Update(msg)
 	model := updated.(Model)
 
@@ -423,6 +754,35 @@ func TestSearchTypingQDoesNotQuit(t *testing.T) {
 	assertQuitCmd(t, cmd)
 }
 
+func TestSearchBarRendersAsSingleStaticLineWhileTyping(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.chats = makeChatSummaries(12)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "Harsh" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	view := m.View()
+	assertViewFitsWidth(t, view, m.width)
+	assertViewAvoidsAutowrapColumn(t, view, m.width, m.height)
+	clean := ansiPattern.ReplaceAllString(view, "")
+	if got := strings.Count(clean, "Search:"); got != 1 {
+		t.Fatalf("Search: occurrences = %d, want 1:\n%s", got, clean)
+	}
+	if !strings.Contains(clean, "Search: Harsh") {
+		t.Fatalf("view missing current search value:\n%s", clean)
+	}
+}
+
 func TestSearchIncludesContactWithoutCachedChat(t *testing.T) {
 	t.Parallel()
 
@@ -434,7 +794,7 @@ func TestSearchIncludesContactWithoutCachedChat(t *testing.T) {
 	m.searching = true
 	m.search.SetValue("bob")
 
-	msg := loadChatsCmd(repo, "bob")()
+	msg := loadChatsCmd(repo, "bob", 0)()
 	updated, _ := m.Update(msg)
 	model := updated.(Model)
 
@@ -449,7 +809,7 @@ func TestSearchIncludesContactWithoutCachedChat(t *testing.T) {
 	}
 }
 
-func TestLoadChatsCmdDefaultsToRecentChatLimit(t *testing.T) {
+func TestLoadChatsCmdReturnsAllChatsNewestFirst(t *testing.T) {
 	t.Parallel()
 
 	repo, err := appstore.New(filepath.Join(t.TempDir(), "app.db"))
@@ -460,7 +820,8 @@ func TestLoadChatsCmdDefaultsToRecentChatLimit(t *testing.T) {
 
 	ctx := context.Background()
 	base := time.Date(2026, 4, 5, 18, 0, 0, 0, time.UTC)
-	for i := 0; i < 6; i++ {
+	const seeded = 6
+	for i := 0; i < seeded; i++ {
 		jid := fmt.Sprintf("user-%d@s.whatsapp.net", i)
 		if err := repo.UpsertChat(ctx, domain.ChatSummary{
 			JID:                jid,
@@ -472,7 +833,7 @@ func TestLoadChatsCmdDefaultsToRecentChatLimit(t *testing.T) {
 		}
 	}
 
-	msg := loadChatsCmd(repo, "")()
+	msg := loadChatsCmd(repo, "", 0)()
 	loaded, ok := msg.(chatsLoadedMsg)
 	if !ok {
 		t.Fatalf("loadChatsCmd() type = %T, want chatsLoadedMsg", msg)
@@ -480,11 +841,11 @@ func TestLoadChatsCmdDefaultsToRecentChatLimit(t *testing.T) {
 	if loaded.err != nil {
 		t.Fatalf("loadChatsCmd() error = %v", loaded.err)
 	}
-	if len(loaded.chats) != defaultChatListLimit {
-		t.Fatalf("len(loaded.chats) = %d, want %d", len(loaded.chats), defaultChatListLimit)
+	if len(loaded.chats) != seeded {
+		t.Fatalf("len(loaded.chats) = %d, want %d", len(loaded.chats), seeded)
 	}
 	if loaded.chats[0].Title != "User 5" {
-		t.Fatalf("loaded.chats[0].Title = %q, want User 5", loaded.chats[0].Title)
+		t.Fatalf("loaded.chats[0].Title = %q, want User 5 (newest)", loaded.chats[0].Title)
 	}
 }
 
@@ -576,7 +937,7 @@ func TestThreadComposeCtrlVStagesClipboardImage(t *testing.T) {
 	repo := seededRepo(t)
 	transport := &fakeTransport{events: make(chan domain.Event, 1)}
 	clipboard := &fakeClipboard{image: []byte{0x89, 'P', 'N', 'G'}}
-	m := NewModelWithClipboard(repo, transport, clipboard)
+	m := NewModel(repo, transport).WithClipboard(clipboard)
 	m.width = 96
 	m.height = 26
 	m.ready = true
@@ -617,7 +978,7 @@ func TestThreadComposeEnterSendsStagedClipboardImage(t *testing.T) {
 	repo := seededRepo(t)
 	transport := &fakeTransport{events: make(chan domain.Event, 1)}
 	clipboard := &fakeClipboard{image: []byte{0x89, 'P', 'N', 'G'}}
-	m := NewModelWithClipboard(repo, transport, clipboard)
+	m := NewModel(repo, transport).WithClipboard(clipboard)
 	m.width = 96
 	m.height = 26
 	m.ready = true
@@ -668,7 +1029,7 @@ func TestThreadComposeAltVStagesVoiceNote(t *testing.T) {
 	if err := os.WriteFile(recorder.path, []byte("voice"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	m := NewModelWithRuntimeOptions(repo, transport, &fakeClipboard{}, &fakeSounder{}, recorder, t.TempDir(), false)
+	m := NewModel(repo, transport).WithClipboard(&fakeClipboard{}).WithSounder(&fakeSounder{}).WithRecorder(recorder).WithDownloadDir(t.TempDir())
 	m.width = 96
 	m.height = 26
 	m.ready = true
@@ -1001,8 +1362,15 @@ func TestThreadComposeExpandsForMultilineDraft(t *testing.T) {
 	if !strings.Contains(view, "hello") || !strings.Contains(view, "my name is Chirag") || !strings.Contains(view, "- hello") {
 		t.Fatalf("thread view missing multiline draft:\n%s", view)
 	}
-	if got := m.composer.Height(); got <= 3 {
-		t.Fatalf("composer height = %d, want > 3 for multiline draft", got)
+	if got := m.composer.Height(); got != 3 {
+		t.Fatalf("composer height = %d, want exactly 3 rows for a 3-line draft", got)
+	}
+
+	// An empty draft needs a single row: one prompt arrow, not three.
+	m.composer.SetValue("")
+	m.resizeComposer(80, 8)
+	if got := m.composer.Height(); got != 1 {
+		t.Fatalf("composer height = %d, want 1 for empty draft", got)
 	}
 }
 
@@ -1167,7 +1535,7 @@ func TestThreadDownloadsLatestMedia(t *testing.T) {
 
 	repo := seededRepo(t)
 	transport := &fakeTransport{events: make(chan domain.Event, 1)}
-	m := NewModelWithRuntimeOptions(repo, transport, &fakeClipboard{}, &fakeSounder{}, &fakeVoiceRecorder{}, t.TempDir(), false)
+	m := NewModel(repo, transport).WithClipboard(&fakeClipboard{}).WithSounder(&fakeSounder{}).WithRecorder(&fakeVoiceRecorder{}).WithDownloadDir(t.TempDir())
 	m.width = 96
 	m.height = 26
 	m.ready = true
@@ -1201,7 +1569,7 @@ func TestTransportNotifyRingsBell(t *testing.T) {
 
 	repo := seededRepo(t)
 	sound := &fakeSounder{}
-	m := NewModelWithOptions(repo, &fakeTransport{events: make(chan domain.Event, 1)}, &fakeClipboard{}, sound, false)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)}).WithClipboard(&fakeClipboard{}).WithSounder(sound)
 	m.width = 96
 	m.height = 26
 	m.ready = true
@@ -1537,7 +1905,7 @@ func TestSearchResultsStayWithinTerminalHeight(t *testing.T) {
 	m.status = "connected"
 	m.searching = true
 	m.search.SetValue("h")
-	msg := loadChatsCmd(repo, "h")()
+	msg := loadChatsCmd(repo, "h", 0)()
 	updated, _ := m.Update(msg)
 	model := updated.(Model)
 	model.selected = 10
@@ -1662,6 +2030,20 @@ func makeThreadMessages(chatJID string, count int) []domain.Message {
 	return messages
 }
 
+func makeChatSummaries(count int) []domain.ChatSummary {
+	base := time.Date(2026, 4, 5, 18, 0, 0, 0, time.UTC)
+	chats := make([]domain.ChatSummary, 0, count)
+	for i := 0; i < count; i++ {
+		chats = append(chats, domain.ChatSummary{
+			JID:                fmt.Sprintf("chat-%02d@s.whatsapp.net", i),
+			Title:              fmt.Sprintf("Chat %02d", i),
+			LastMessagePreview: fmt.Sprintf("Preview %02d", i),
+			LastMessageAt:      base.Add(-time.Duration(i) * time.Minute),
+		})
+	}
+	return chats
+}
+
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 func assertViewFitsWidth(t *testing.T, view string, width int) {
@@ -1672,5 +2054,270 @@ func assertViewFitsWidth(t *testing.T, view string, width int) {
 		if lipgloss.Width(clean) > width {
 			t.Fatalf("line width %d exceeds %d: %q", lipgloss.Width(clean), width, clean)
 		}
+	}
+}
+
+func assertViewFitsHeight(t *testing.T, view string, height int) {
+	t.Helper()
+
+	if got := countRenderedLines(view); got > height {
+		t.Fatalf("view height %d exceeds %d:\n%s", got, height, view)
+	}
+}
+
+func assertViewAvoidsAutowrapColumn(t *testing.T, view string, terminalWidth, height int) {
+	t.Helper()
+
+	lines := strings.Split(view, "\n")
+	if len(lines) != height {
+		t.Fatalf("view height = %d, want %d:\n%s", len(lines), height, view)
+	}
+	maxWidth := terminalWidth - 1
+	for idx, line := range lines {
+		clean := ansiPattern.ReplaceAllString(line, "")
+		if got := lipgloss.Width(clean); got > maxWidth {
+			t.Fatalf("line %d width = %d, want <= %d: %q", idx+1, got, maxWidth, clean)
+		}
+	}
+}
+
+func TestClearPendingAttachmentsKeepsUserPickedFiles(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	dir := t.TempDir()
+	userFile := filepath.Join(dir, "brief.pdf")
+	tempFile := filepath.Join(dir, "clipboard.png")
+	for _, path := range []string{userFile, tempFile} {
+		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.pendingAttachments = []stagedAttachment{
+		{token: "[File brief.pdf]", path: userFile, kind: domain.MediaKindDocument},
+		{token: "[Image #1]", path: tempFile, kind: domain.MediaKindImage, temp: true},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := updated.(Model)
+	if len(model.pendingAttachments) != 0 {
+		t.Fatalf("pendingAttachments = %#v, want cleared", model.pendingAttachments)
+	}
+	if _, err := os.Stat(userFile); err != nil {
+		t.Fatalf("user-picked file was removed on cancel: %v", err)
+	}
+	if _, err := os.Stat(tempFile); !os.IsNotExist(err) {
+		t.Fatalf("temp attachment file should be removed on cancel, stat err = %v", err)
+	}
+}
+
+func TestVoiceStopErrorReleasesStoppingLatch(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.stoppingVoice = true
+
+	updated, _ := m.Update(attachmentStagedMsg{err: fmt.Errorf("gst-launch died")})
+	model := updated.(Model)
+	if model.stoppingVoice {
+		t.Fatal("expected failed voice stop to release the stopping latch")
+	}
+	if model.lastErr == "" {
+		t.Fatal("expected the stop error to surface in lastErr")
+	}
+}
+
+func TestTruncateTextMeasuresDisplayWidth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		text  string
+		width int
+	}{
+		{name: "emoji", text: "👍👍👍👍", width: 5},
+		{name: "cjk", text: "你好世界你好世界", width: 7},
+		{name: "mixed", text: "call 📞 me later today", width: 9},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := truncateText(tt.text, tt.width)
+			if w := lipgloss.Width(got); w > tt.width {
+				t.Fatalf("truncateText(%q, %d) width = %d, want <= %d (got %q)", tt.text, tt.width, w, tt.width, got)
+			}
+			if !strings.HasSuffix(got, "…") {
+				t.Fatalf("truncateText(%q, %d) = %q, want ellipsis suffix", tt.text, tt.width, got)
+			}
+		})
+	}
+}
+
+func TestTruncateTextHeadKeepsTail(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		text  string
+		width int
+		want  string
+	}{
+		{name: "short passes through", text: "ab", width: 4, want: "ab"},
+		{name: "long keeps tail", text: "abcdef", width: 4, want: "…def"},
+		{name: "cjk tail", text: "你好世界", width: 5, want: "…世界"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := truncateTextHead(tt.text, tt.width); got != tt.want {
+				t.Fatalf("truncateTextHead(%q, %d) = %q, want %q", tt.text, tt.width, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderHeaderStaysSingleLineForLongThreadTitles(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.ready = true
+
+	for _, width := range []int{42, 60, 96} {
+		m.width = width
+		header := m.renderHeader("Project Alpha Extended Launch Planning Group", "")
+		lines := strings.Split(header, "\n")
+		if len(lines) != 3 {
+			t.Fatalf("width %d: header rendered %d lines, want 3 (blank, title, rule):\n%s", width, len(lines), header)
+		}
+		clean := ansiPattern.ReplaceAllString(lines[1], "")
+		if got := lipgloss.Width(clean); got > max(40, width-2) {
+			t.Fatalf("width %d: header line width = %d, want <= %d: %q", width, got, max(40, width-2), clean)
+		}
+	}
+}
+
+func TestCycleSelectionWrapsBothDirections(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		selected int
+		delta    int
+		total    int
+		want     int
+	}{
+		{name: "down", selected: 0, delta: 1, total: 3, want: 1},
+		{name: "down wraps", selected: 2, delta: 1, total: 3, want: 0},
+		{name: "up wraps", selected: 0, delta: -1, total: 3, want: 2},
+		{name: "empty list", selected: 0, delta: -1, total: 0, want: 0},
+		{name: "out of range normalizes", selected: 5, delta: 1, total: 3, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := cycleSelection(tt.selected, tt.delta, tt.total); got != tt.want {
+				t.Fatalf("cycleSelection(%d, %d, %d) = %d, want %d", tt.selected, tt.delta, tt.total, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCtrlLForcesFullRepaint(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+
+	for _, mode := range []viewMode{viewChats, viewThread} {
+		m.mode = mode
+		_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+		if cmd == nil {
+			t.Fatalf("mode %d: expected a clear-screen command from ctrl+l", mode)
+		}
+		if got := fmt.Sprintf("%T", cmd()); !strings.Contains(got, "clearScreenMsg") {
+			t.Fatalf("mode %d: cmd() type = %s, want bubbletea clearScreenMsg", mode, got)
+		}
+	}
+}
+
+func TestRenderPanelSizeIsFixedRegardlessOfContent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "empty", content: ""},
+		{name: "short", content: "hello"},
+		{name: "unbroken url", content: "https://example.com/" + strings.Repeat("KVe6xeK12Gy7P9NKD6c-", 20)},
+		{name: "too many lines", content: strings.Repeat("line\n", 40)},
+		{name: "wide and tall", content: strings.Repeat(strings.Repeat("x", 200)+"\n", 40)},
+	}
+	const totalWidth, totalHeight = 40, 10
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			panel := renderPanel(boxStyle, totalWidth, totalHeight, tt.content)
+			lines := strings.Split(panel, "\n")
+			if len(lines) != totalHeight {
+				t.Fatalf("panel height = %d lines, want exactly %d:\n%s", len(lines), totalHeight, panel)
+			}
+			for idx, line := range lines {
+				if got := lipgloss.Width(line); got != totalWidth {
+					t.Fatalf("panel line %d width = %d, want exactly %d: %q", idx+1, got, totalWidth, line)
+				}
+			}
+		})
+	}
+}
+
+func TestChatListHeightUnaffectedByLongPreview(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 30
+	m.ready = true
+	m.chats = makeChatSummaries(3)
+
+	baseline := countRenderedLines(m.renderChatList())
+
+	m.chats[0].LastMessagePreview = "https://u3447072.ct.sendgrid.net/ls/click?upn=" + strings.Repeat("2FfA8kUcTfdj2zZbRwWxeemwo7qmqfXC-", 15)
+	m.selected = 0
+	if got := countRenderedLines(m.renderChatList()); got != baseline {
+		t.Fatalf("chat list height changed from %d to %d lines because of a long preview", baseline, got)
+	}
+}
+
+func TestWrapTextClipsOverlongFirstWord(t *testing.T) {
+	t.Parallel()
+
+	got := wrapText(strings.Repeat("x", 100), 20)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("wrapText produced %d lines, want 1: %q", len(lines), got)
+	}
+	if w := lipgloss.Width(lines[0]); w > 20 {
+		t.Fatalf("wrapped line width = %d, want <= 20: %q", w, lines[0])
 	}
 }

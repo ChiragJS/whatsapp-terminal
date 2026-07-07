@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -237,6 +238,212 @@ func TestListChatsExcludesStatusBroadcast(t *testing.T) {
 	}
 	if chats[0].JID != "alice@s.whatsapp.net" {
 		t.Fatalf("chats[0].JID = %q, want alice@s.whatsapp.net", chats[0].JID)
+	}
+}
+
+func TestStoreMigrationClearsJIDShapedTitles(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "app.db")
+	repo, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+	const groupJID = "120363405662701156@g.us"
+	const bareGroupJID = "120363405662701918@g.us"
+	const cleanJID = "alice@s.whatsapp.net"
+	if err := insertRawChatTitle(ctx, repo, groupJID, groupJID, true); err != nil {
+		t.Fatalf("insertRawChatTitle(poisoned full JID) error = %v", err)
+	}
+	if err := insertRawChatTitle(ctx, repo, bareGroupJID, "120363405662701918", true); err != nil {
+		t.Fatalf("insertRawChatTitle(poisoned bare JID) error = %v", err)
+	}
+	if err := repo.UpsertChat(ctx, domain.ChatSummary{
+		JID:                cleanJID,
+		Title:              "Alice Mercer",
+		LastMessagePreview: "hi",
+		LastMessageAt:      time.Date(2026, 4, 5, 10, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("UpsertChat(clean) error = %v", err)
+	}
+	_ = repo.Close()
+
+	// Reopening triggers init(), which runs the migration.
+	repo, err = New(dbPath)
+	if err != nil {
+		t.Fatalf("New() reopen error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	// Verify the raw chats.title column directly — GetChat applies a SELECT
+	// CASE that re-substitutes the JID for empty titles, which would mask
+	// whether the migration actually cleared the stored value.
+	if got := storedChatTitle(t, repo, groupJID); got != "" {
+		t.Fatalf("full-JID poisoned chat raw title = %q, want empty after migration", got)
+	}
+	if got := storedChatTitle(t, repo, bareGroupJID); got != "" {
+		t.Fatalf("bare-JID poisoned chat raw title = %q, want empty after migration", got)
+	}
+	if got := storedChatTitle(t, repo, cleanJID); got != "Alice Mercer" {
+		t.Fatalf("clean chat raw title = %q, want Alice Mercer (untouched)", got)
+	}
+}
+
+func insertRawChatTitle(ctx context.Context, repo *Store, jid, title string, isGroup bool) error {
+	_, err := repo.db.ExecContext(ctx, `
+INSERT INTO chats (jid, title, normalized_title, is_group, last_message_preview, last_message_at)
+VALUES (?, ?, ?, ?, ?, ?)
+`, jid, title, NormalizeSearch(strings.Join([]string{title, jid}, " ")), boolToInt(isGroup), "hi", timeString(time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC)))
+	return err
+}
+
+func storedChatTitle(t *testing.T, repo *Store, jid string) string {
+	t.Helper()
+	row := repo.db.QueryRow(`SELECT title FROM chats WHERE jid = ?`, jid)
+	var title string
+	if err := row.Scan(&title); err != nil {
+		t.Fatalf("scan raw title for %s: %v", jid, err)
+	}
+	return title
+}
+
+func TestUnknownGroupTitleStaysEmptyInsteadOfJID(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	const groupJID = "120363405662701156@g.us"
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:         "m1",
+		ChatJID:    groupJID,
+		SenderJID:  "alice@s.whatsapp.net",
+		SenderName: "Alice",
+		Text:       "hello group",
+		Timestamp:  time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+		Receipt:    domain.ReceiptStateReceived,
+		IsGroup:    true,
+	}, true); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+
+	chat, err := repo.GetChat(ctx, groupJID)
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat == nil || chat.Title != "" {
+		t.Fatalf("GetChat() = %#v, want empty title", chat)
+	}
+	chats, err := repo.ListChats(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 1 || chats[0].Title != "" {
+		t.Fatalf("ListChats() = %#v, want one chat with empty title", chats)
+	}
+	if got := storedChatTitle(t, repo, groupJID); got != "" {
+		t.Fatalf("raw title = %q, want empty", got)
+	}
+}
+
+func TestRecordMessageWithJIDTitleDoesNotPersistTitle(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	const groupJID = "120363405662701156@g.us"
+	if err := repo.RecordMessageWithChatTitle(ctx, domain.Message{
+		ID:         "m1",
+		ChatJID:    groupJID,
+		SenderJID:  "alice@s.whatsapp.net",
+		SenderName: "Alice",
+		Text:       "hello group",
+		Timestamp:  time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+		Receipt:    domain.ReceiptStateReceived,
+		IsGroup:    true,
+	}, groupJID, true); err != nil {
+		t.Fatalf("RecordMessageWithChatTitle() error = %v", err)
+	}
+	if got := storedChatTitle(t, repo, groupJID); got != "" {
+		t.Fatalf("raw title = %q, want empty", got)
+	}
+}
+
+func TestUpdateChatTitlePreservesChatMetadata(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	const groupJID = "120363405662701156@g.us"
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:         "m1",
+		ChatJID:    groupJID,
+		SenderJID:  "alice@s.whatsapp.net",
+		SenderName: "Alice",
+		Text:       "hello group",
+		Timestamp:  time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC),
+		Receipt:    domain.ReceiptStateReceived,
+		IsGroup:    true,
+	}, true); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+	if err := repo.UpdateChatTitle(ctx, groupJID, "Project Alpha", true); err != nil {
+		t.Fatalf("UpdateChatTitle() error = %v", err)
+	}
+
+	chat, err := repo.GetChat(ctx, groupJID)
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat == nil {
+		t.Fatal("GetChat() = nil, want chat")
+	}
+	if chat.Title != "Project Alpha" {
+		t.Fatalf("Title = %q, want Project Alpha", chat.Title)
+	}
+	if chat.LastMessageID != "m1" || chat.LastMessagePreview != "hello group" || chat.LastSenderName != "Alice" {
+		t.Fatalf("latest metadata changed unexpectedly: %#v", chat)
+	}
+	if chat.UnreadCount != 1 {
+		t.Fatalf("UnreadCount = %d, want 1", chat.UnreadCount)
+	}
+}
+
+func TestUpdateChatTitleDoesNotCreateChat(t *testing.T) {
+	t.Parallel()
+
+	repo, err := New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	if err := repo.UpdateChatTitle(ctx, "120363405662701156@g.us", "Project Alpha", true); err != nil {
+		t.Fatalf("UpdateChatTitle() error = %v", err)
+	}
+	chats, err := repo.ListChats(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("ListChats() error = %v", err)
+	}
+	if len(chats) != 0 {
+		t.Fatalf("ListChats() len = %d, want 0", len(chats))
 	}
 }
 
