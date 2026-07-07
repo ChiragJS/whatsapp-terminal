@@ -363,7 +363,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.chatJID == m.currentChatID {
-			previousLen := len(m.messages)
+			lineWidth := m.threadLayout().contentWidth - boxStyle.GetHorizontalFrameSize()
+			previousLineCount := len(m.threadMessageLines(lineWidth))
 			previousOldestID := oldestMessageID(m.messages)
 			previousNewestID := newestMessageID(m.messages)
 			wasAtBottom := m.threadScroll == 0
@@ -376,12 +377,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.threadMessageLimit = messageLimit
 			}
 			m.messages = msg.messages
+			newLineCount := len(m.threadMessageLines(lineWidth))
 			if wasAtBottom {
 				m.threadScroll = 0
-			} else if previousNewestID != "" && newestMessageID(msg.messages) != previousNewestID && len(msg.messages) > previousLen {
-				m.threadScroll += len(msg.messages) - previousLen
+			} else if previousNewestID != "" && newestMessageID(msg.messages) != previousNewestID && newLineCount > previousLineCount {
+				// New messages appended at the bottom while scrolled up:
+				// grow the offset so the view keeps showing the same lines.
+				m.threadScroll += newLineCount - previousLineCount
 			}
-			m.threadScroll = clampThreadScroll(m.threadScroll, len(m.messages))
+			m.threadScroll = min(max(0, m.threadScroll), m.maxThreadScroll())
 			if len(msg.messages) == 0 && m.mode == viewThread && !m.threadHistoryPending {
 				var cmd tea.Cmd
 				m, cmd = m.loadOlderThreadMessages()
@@ -747,7 +751,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgdown", "ctrl+d":
 		return m.scrollThread(-threadPageScroll)
 	case "home":
-		return m.scrollThread(len(m.messages))
+		return m.scrollThread(max(1, m.maxThreadScroll()))
 	case "end":
 		m.threadScroll = 0
 		return m, nil
@@ -1825,69 +1829,67 @@ func actionRow(key, label string, width int) string {
 	return line
 }
 
-func (m Model) threadBody(messageHeight, width int) string {
+// renderThreadMessage renders one message as its display lines: a
+// timestamp+sender header, the wrapped body, and optional receipt and
+// download annotations.
+func renderThreadMessage(msg domain.Message, width int) string {
+	name := msg.SenderName
+	if name == "" {
+		name = msg.SenderJID
+	}
+	var nameStyle lipgloss.Style
+	switch {
+	case msg.FromMe:
+		name = "You"
+		nameStyle = youNameStyle
+	case msg.IsGroup:
+		nameStyle = memberNameStyle
+	default:
+		nameStyle = peerNameStyle
+	}
+	stamp := timestampStyle.Render(msg.Timestamp.Local().Format("15:04"))
+	who := nameStyle.Render(truncateText(name, max(8, width-10)))
+	text := stamp + "  " + who + "\n" + bodyStyle.Render(wrapText(msg.Text, width))
+	if suffix := receiptSuffix(msg); suffix != "" {
+		text += "\n" + strings.TrimSpace(suffix)
+	}
+	if msg.DownloadedPath != "" {
+		text += "\n" + subtleStyle.Render("↳ saved · "+filepath.Base(msg.DownloadedPath))
+	}
+	return text
+}
+
+// threadMessageLines flattens every cached message into display lines with a
+// blank separator between messages. The thread scroll offset is measured in
+// these lines, so scrolling is smooth and long messages are fully reachable.
+func (m Model) threadMessageLines(width int) []string {
 	width = max(18, width)
-	type renderedMessage struct {
-		text  string
-		lines int
+	lines := make([]string, 0, len(m.messages)*3)
+	for i, msg := range m.messages {
+		if i > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, strings.Split(renderThreadMessage(msg, width), "\n")...)
 	}
-	rendered := make([]renderedMessage, 0, len(m.messages))
-	for _, msg := range m.messages {
-		name := msg.SenderName
-		if name == "" {
-			name = msg.SenderJID
-		}
-		var nameStyle lipgloss.Style
-		switch {
-		case msg.FromMe:
-			name = "You"
-			nameStyle = youNameStyle
-		case msg.IsGroup:
-			nameStyle = memberNameStyle
-		default:
-			nameStyle = peerNameStyle
-		}
-		stamp := timestampStyle.Render(msg.Timestamp.Local().Format("15:04"))
-		who := nameStyle.Render(truncateText(name, max(8, width-10)))
-		header := stamp + "  " + who
-		body := wrapText(msg.Text, width)
-		text := header + "\n" + bodyStyle.Render(body)
-		if suffix := receiptSuffix(msg); suffix != "" {
-			text += "\n" + strings.TrimSpace(suffix)
-		}
-		if msg.DownloadedPath != "" {
-			text += "\n" + subtleStyle.Render("↳ saved · "+filepath.Base(msg.DownloadedPath))
-		}
-		rendered = append(rendered, renderedMessage{text: text, lines: countRenderedLines(text)})
-	}
-	if len(rendered) == 0 {
+	return lines
+}
+
+// threadBody renders the visible window of the message log: the viewport is
+// anchored to the bottom (newest lines) and threadScroll lifts it up by
+// whole lines.
+func (m Model) threadBody(contentHeight, width int) string {
+	if len(m.messages) == 0 {
 		if m.threadHistoryPending {
 			return slateStyle.Render("Requesting messages for this chat from your phone…")
 		}
 		return slateStyle.Render("No cached messages for this chat yet.")
 	}
-
-	selected := make([]string, 0, len(rendered))
-	used := 0
-	end := len(rendered) - clampThreadScroll(m.threadScroll, len(rendered))
-	if end < 1 {
-		end = 1
-	}
-	for idx := end - 1; idx >= 0; idx-- {
-		extra := rendered[idx].lines
-		if len(selected) > 0 {
-			extra += 1
-		}
-		if used+extra > messageHeight && len(selected) > 0 {
-			break
-		}
-		selected = append(selected, rendered[idx].text)
-		used += extra
-	}
-	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
-		selected[left], selected[right] = selected[right], selected[left]
-	}
-	return strings.Join(selected, "\n\n")
+	lines := m.threadMessageLines(width)
+	contentHeight = max(1, contentHeight)
+	scroll := min(max(0, m.threadScroll), max(0, len(lines)-contentHeight))
+	end := len(lines) - scroll
+	start := max(0, end-contentHeight)
+	return strings.Join(lines[start:end], "\n")
 }
 
 func (m Model) composerBody(width int) string {
@@ -2591,8 +2593,10 @@ func clampComposerHeight(lines, maxHeight int) int {
 	return lines
 }
 
+// paddedContentHeight converts a panel's total height into its content-line
+// budget. renderPanel hard-clips content, so the full inner height is usable.
 func paddedContentHeight(totalHeight int) int {
-	return max(1, totalHeight-boxStyle.GetVerticalFrameSize()-2)
+	return max(1, totalHeight-boxStyle.GetVerticalFrameSize())
 }
 
 func parseComposeAction(raw string) (composeAction, error) {

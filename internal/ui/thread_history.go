@@ -6,6 +6,9 @@ import (
 	"github.com/chirag/whatsapp-terminal/internal/domain"
 )
 
+// scrollThread moves the thread viewport by delta display lines (positive =
+// toward older messages). Nearing the oldest cached line triggers a
+// background load of older history.
 func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
 	if delta == 0 || m.currentChatID == "" {
 		return m, nil
@@ -14,7 +17,7 @@ func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
 	stateChanged := false
 	if len(m.messages) > 0 {
 		previousScroll := m.threadScroll
-		m.threadScroll = clampThreadScroll(m.threadScroll+delta, len(m.messages))
+		m.threadScroll = min(max(0, m.threadScroll+delta), m.maxThreadScroll())
 		stateChanged = previousScroll != m.threadScroll
 	}
 
@@ -27,6 +30,14 @@ func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, cmd
+}
+
+// maxThreadScroll is the highest line offset the viewport can reach: total
+// rendered message lines minus the visible window.
+func (m Model) maxThreadScroll() int {
+	layout := m.threadLayout()
+	lines := m.threadMessageLines(layout.contentWidth - boxStyle.GetHorizontalFrameSize())
+	return max(0, len(lines)-paddedContentHeight(layout.messageHeight))
 }
 
 func (m Model) loadOlderThreadMessages() (Model, tea.Cmd) {
@@ -58,21 +69,7 @@ func (m Model) threadNearOldestBoundary() bool {
 	if len(m.messages) == 0 {
 		return true
 	}
-	return m.threadScroll >= max(0, len(m.messages)-threadPrefetchMargin)
-}
-
-func clampThreadScroll(scroll, total int) int {
-	if total <= 1 {
-		return 0
-	}
-	if scroll < 0 {
-		return 0
-	}
-	maxScroll := total - 1
-	if scroll > maxScroll {
-		return maxScroll
-	}
-	return scroll
+	return m.threadScroll >= max(0, m.maxThreadScroll()-threadPrefetchMargin)
 }
 
 func oldestMessageID(messages []domain.Message) string {

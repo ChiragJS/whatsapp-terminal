@@ -1727,7 +1727,7 @@ func TestThreadScrollLoadsOlderCachedMessages(t *testing.T) {
 	m.currentChatID = chatJID
 	m.messages = initial
 	m.threadMessageLimit = messageLimit
-	m.threadScroll = len(initial) - 1
+	m.threadScroll = m.maxThreadScroll()
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	model := updated.(Model)
@@ -2319,5 +2319,82 @@ func TestWrapTextClipsOverlongFirstWord(t *testing.T) {
 	}
 	if w := lipgloss.Width(lines[0]); w > 20 {
 		t.Fatalf("wrapped line width = %d, want <= 20: %q", w, lines[0])
+	}
+}
+
+func TestThreadScrollReachesEveryLineOfTallMessage(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+
+	// One message far taller than any viewport: 40 numbered lines.
+	var b strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&b, "line-%02d\n", i)
+	}
+	m.messages = []domain.Message{{
+		ID:        "tall",
+		ChatJID:   m.currentChatID,
+		SenderJID: "alice@s.whatsapp.net",
+		Text:      strings.TrimSpace(b.String()),
+		Timestamp: time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC),
+		Receipt:   domain.ReceiptStateReceived,
+	}}
+	m.threadMessageLimit = messageLimit
+
+	// Use the same viewport geometry the app renders with, so the scroll
+	// ceiling and the visible window agree.
+	layout := m.threadLayout()
+	window := paddedContentHeight(layout.messageHeight)
+	width := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
+	seen := make(map[string]bool)
+	for scroll := 0; scroll <= m.maxThreadScroll(); scroll++ {
+		m.threadScroll = scroll
+		body := ansiPattern.ReplaceAllString(m.threadBody(window, width), "")
+		if got := countRenderedLines(body); got != window {
+			t.Fatalf("scroll %d: window rendered %d lines, want %d:\n%s", scroll, got, window, body)
+		}
+		for _, line := range strings.Split(body, "\n") {
+			seen[strings.TrimSpace(line)] = true
+		}
+	}
+	for i := 1; i <= 40; i++ {
+		if !seen[fmt.Sprintf("line-%02d", i)] {
+			t.Fatalf("line-%02d was never reachable by scrolling", i)
+		}
+	}
+}
+
+func TestThreadScrollMovesOneLineAtATime(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 20)
+	m.threadMessageLimit = messageLimit
+
+	atBottom := ansiPattern.ReplaceAllString(m.threadBody(6, 80), "")
+	m.threadScroll = 1
+	scrolled := ansiPattern.ReplaceAllString(m.threadBody(6, 80), "")
+
+	bottomLines := strings.Split(atBottom, "\n")
+	scrolledLines := strings.Split(scrolled, "\n")
+	// Shifting by one line means the scrolled window's tail equals the
+	// bottom window's head region, offset by exactly one row.
+	for i := 1; i < len(bottomLines); i++ {
+		if scrolledLines[i] != bottomLines[i-1] {
+			t.Fatalf("scroll by 1 did not shift by one line:\nbottom:\n%s\nscrolled:\n%s", atBottom, scrolled)
+		}
 	}
 }
