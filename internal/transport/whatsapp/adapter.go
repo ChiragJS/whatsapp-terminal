@@ -182,8 +182,11 @@ func (a *Adapter) DownloadMedia(ctx context.Context, msg domain.Message, downloa
 	}
 
 	targetPath := filepath.Join(downloadDir, downloadFileName(msg))
+	// whatsmeow writes the media and then reads the file back to verify its
+	// hash, so the handle must be read-write; O_WRONLY fails the verification
+	// with "failed to hash file: read ...".
 	// #nosec G304 -- downloadDir is an application-controlled directory for user-requested media exports.
-	file, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	file, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create media file: %w", err)
 	}
