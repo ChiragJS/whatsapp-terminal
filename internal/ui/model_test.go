@@ -384,7 +384,7 @@ func TestRenderChatItemAlwaysProducesExactlyTwoLines(t *testing.T) {
 		{JID: "120363@g.us", Title: "120363", LastMessagePreview: "x", IsGroup: true, UnreadCount: 250},
 	}
 	for i, chat := range cases {
-		out := renderChatItem(chat, 40, i == 1)
+		out := renderChatItem(chat, 40, i == 1, nil)
 		if got := countRenderedLines(out); got != 2 {
 			t.Fatalf("case %d: renderChatItem produced %d lines, want 2:\n%s", i, got, out)
 		}
@@ -401,7 +401,7 @@ func TestRenderChatItemMasksUnknownDirectPhoneArtifacts(t *testing.T) {
 		LastMessagePreview: "[unsupported message]",
 		UnreadCount:        2,
 	}
-	out := renderChatItem(chat, 48, true)
+	out := renderChatItem(chat, 48, true, nil)
 	if !strings.Contains(out, "Unknown contact · …1284") {
 		t.Fatalf("renderChatItem() missing masked contact label:\n%s", out)
 	}

@@ -94,10 +94,8 @@ func TestResolveMentionNamesTriesPhoneThenLIDAlias(t *testing.T) {
 		"22233344455@lid":       "Dad",
 	}
 	lookup := func(jid string) string { return contacts[jid] }
-	messages := []domain.Message{
-		{Text: "@911111 and @22233344455 and @333333"},
-	}
-	names := resolveMentionNames(lookup, messages)
+	texts := []string{"@911111 and @22233344455 and @333333"}
+	names := resolveMentionNames(lookup, texts)
 	if names["911111"] != "Mom" || names["22233344455"] != "Dad" {
 		t.Fatalf("names = %#v, want Mom via phone JID and Dad via LID alias", names)
 	}
@@ -243,5 +241,67 @@ func TestLoadMessagesCmdResolvesMentionsFromStore(t *testing.T) {
 	body := plain(model.threadBody(12, 80))
 	if !strings.Contains(body, "@Sarthak Mittal") {
 		t.Fatalf("thread body = %q, want resolved mention", body)
+	}
+}
+
+func TestChatListPreviewResolvesMentions(t *testing.T) {
+	t.Parallel()
+
+	mentions := map[string]string{"41755755978893": "Sarthak Mittal"}
+	chat := domain.ChatSummary{
+		JID:                "group@g.us",
+		Title:              "Placement Group",
+		LastMessagePreview: "@41755755978893 teri bachpan ki video",
+		LastSenderName:     "Sahil",
+		IsGroup:            true,
+		LastMessageAt:      time.Date(2026, 7, 7, 14, 32, 0, 0, time.UTC),
+	}
+	out := plain(renderChatItem(chat, 60, false, mentions))
+	if !strings.Contains(out, "@Sarthak") {
+		t.Fatalf("chat item preview missing resolved mention:\n%s", out)
+	}
+	if strings.Contains(out, "41755755978893") {
+		t.Fatalf("chat item preview leaked raw mention id:\n%s", out)
+	}
+}
+
+func TestLoadChatsCmdResolvesPreviewMentions(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	ctx := context.Background()
+	if err := repo.UpsertContact(ctx, domain.Contact{JID: "41755755978893@lid", DisplayName: "Sarthak Mittal"}); err != nil {
+		t.Fatalf("UpsertContact() error = %v", err)
+	}
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID:        "preview-mention",
+		ChatJID:   "project-alpha@g.us",
+		SenderJID: "bob@s.whatsapp.net",
+		Text:      "@41755755978893 dekho",
+		Timestamp: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC),
+		Receipt:   domain.ReceiptStateReceived,
+		IsGroup:   true,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+
+	msg := loadChatsCmd(repo, "", defaultChatListLimit)()
+	loaded, ok := msg.(chatsLoadedMsg)
+	if !ok {
+		t.Fatalf("cmd() type = %T, want chatsLoadedMsg", msg)
+	}
+	if loaded.mentions["41755755978893"] != "Sarthak Mittal" {
+		t.Fatalf("mentions = %#v, want preview mention resolved", loaded.mentions)
+	}
+
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 30
+	m.ready = true
+	updated, _ := m.Update(loaded)
+	model := updated.(Model)
+	view := plain(model.View())
+	if !strings.Contains(view, "@Sarthak") {
+		t.Fatalf("chat list view missing resolved mention:\n%s", view)
 	}
 }

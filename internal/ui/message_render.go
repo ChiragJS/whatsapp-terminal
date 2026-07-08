@@ -27,6 +27,9 @@ var inlineMarkup = regexp.MustCompile(
 // @ followed by the numeric user part of the mentioned JID.
 var mentionToken = regexp.MustCompile(`^@(\d{6,20})(\W*)$`)
 
+// mentionAnywhere finds mention tokens inside larger text.
+var mentionAnywhere = regexp.MustCompile(`@(\d{6,20})`)
+
 type spanKind int
 
 const (
@@ -287,14 +290,13 @@ func dateSeparator(day, now time.Time, width int) string {
 	return hairlineStyle.Render(rule) + "  " + subtleStyle.Render(label) + "  " + hairlineStyle.Render(rule)
 }
 
-// resolveMentionNames maps every mention token found in the given messages
-// to a contact name, trying the phone-number JID first and the LID alias
+// resolveMentionNames maps every mention token found in the given texts to
+// a contact name, trying the phone-number JID first and the LID alias
 // second. Unresolvable mentions are left out and render as raw tokens.
-func resolveMentionNames(lookup func(jid string) string, messages []domain.Message) map[string]string {
+func resolveMentionNames(lookup func(jid string) string, texts []string) map[string]string {
 	names := make(map[string]string)
-	pattern := regexp.MustCompile(`@(\d{6,20})`)
-	for _, msg := range messages {
-		for _, match := range pattern.FindAllStringSubmatch(msg.Text, -1) {
+	for _, text := range texts {
+		for _, match := range mentionAnywhere.FindAllStringSubmatch(text, -1) {
 			digits := match[1]
 			if _, seen := names[digits]; seen {
 				continue
@@ -312,4 +314,18 @@ func resolveMentionNames(lookup func(jid string) string, messages []domain.Messa
 		return nil
 	}
 	return names
+}
+
+// substituteMentions replaces "@123…" tokens with "@Name" in plain text.
+// Used where styled rendering is unavailable, such as chat-list previews.
+func substituteMentions(text string, mentions map[string]string) string {
+	if len(mentions) == 0 {
+		return text
+	}
+	return mentionAnywhere.ReplaceAllStringFunc(text, func(token string) string {
+		if name := mentions[strings.TrimPrefix(token, "@")]; name != "" {
+			return "@" + name
+		}
+		return token
+	})
 }

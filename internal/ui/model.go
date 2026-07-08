@@ -50,7 +50,9 @@ type transportEventMsg struct {
 
 type chatsLoadedMsg struct {
 	chats []domain.ChatSummary
-	err   error
+	// mentions maps "@123…" tokens found in chat previews to contact names.
+	mentions map[string]string
+	err      error
 }
 
 type messagesLoadedMsg struct {
@@ -154,6 +156,7 @@ type Model struct {
 	chats                []domain.ChatSummary
 	messages             []domain.Message
 	mentionNames         map[string]string
+	chatMentionNames     map[string]string
 	pendingAttachments   []stagedAttachment
 	pathSuggestions      []pathSuggestion
 	pathSuggestionIdx    int
@@ -347,6 +350,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		selectedJID := m.selectedChatJID()
 		m.chats = msg.chats
+		m.chatMentionNames = msg.mentions
 		m.selected = clampSelection(m.selected, len(m.chats))
 		if selectedJID != "" {
 			for idx, chat := range m.chats {
@@ -1189,8 +1193,23 @@ func loadChatsCmd(repo *appstore.Store, query string, limit int) tea.Cmd {
 		limit = defaultChatListLimit
 	}
 	return func() tea.Msg {
-		chats, err := repo.ListChats(context.Background(), query, limit)
-		return chatsLoadedMsg{chats: chats, err: err}
+		ctx := context.Background()
+		chats, err := repo.ListChats(ctx, query, limit)
+		var mentions map[string]string
+		if err == nil {
+			previews := make([]string, 0, len(chats))
+			for _, chat := range chats {
+				previews = append(previews, chat.LastMessagePreview)
+			}
+			mentions = resolveMentionNames(func(jid string) string {
+				name, lookupErr := repo.ContactName(ctx, jid)
+				if lookupErr != nil {
+					return ""
+				}
+				return name
+			}, previews)
+		}
+		return chatsLoadedMsg{chats: chats, mentions: mentions, err: err}
 	}
 }
 
@@ -1234,13 +1253,17 @@ func loadMessagesCmd(repo *appstore.Store, chatJID string, limit int) tea.Cmd {
 		messages, err := repo.ListMessages(ctx, chatJID, limit)
 		var mentions map[string]string
 		if err == nil {
+			texts := make([]string, 0, len(messages))
+			for _, msg := range messages {
+				texts = append(texts, msg.Text)
+			}
 			mentions = resolveMentionNames(func(jid string) string {
 				name, lookupErr := repo.ContactName(ctx, jid)
 				if lookupErr != nil {
 					return ""
 				}
 				return name
-			}, messages)
+			}, texts)
 		}
 		return messagesLoadedMsg{chatJID: chatJID, messages: messages, mentions: mentions, limit: limit, err: err}
 	}
@@ -1607,7 +1630,7 @@ func (m Model) chatListBody(width, height int) string {
 	end := min(len(m.chats), start+visible)
 	lines := make([]string, 0, end-start)
 	for idx := start; idx < end; idx++ {
-		lines = append(lines, renderChatItem(m.chats[idx], width, idx == selected))
+		lines = append(lines, renderChatItem(m.chats[idx], width, idx == selected, m.chatMentionNames))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1654,7 +1677,7 @@ func clampChatListOffset(offset, selected, visible, total int) int {
 	return offset
 }
 
-func renderChatItem(chat domain.ChatSummary, width int, selected bool) string {
+func renderChatItem(chat domain.ChatSummary, width int, selected bool, mentions map[string]string) string {
 	width = max(20, width)
 	railCol := "  "
 	titleStyleApplied := slateStyle
@@ -1689,7 +1712,7 @@ func renderChatItem(chat domain.ChatSummary, width int, selected bool) string {
 	topLine := railCol + titleRendered + strings.Repeat(" ", topGap) + unread
 
 	// Bottom line: preview left, relative time right.
-	preview := collapseWhitespace(chat.LastMessagePreview)
+	preview := collapseWhitespace(substituteMentions(chat.LastMessagePreview, mentions))
 	if preview == "" {
 		preview = "No messages yet"
 	}
@@ -1766,7 +1789,7 @@ func (m Model) chatPreviewBody(width, height int) string {
 	}
 
 	title := truncateText(displayChatTitle(*chat), width)
-	lastPreview := strings.TrimSpace(chat.LastMessagePreview)
+	lastPreview := strings.TrimSpace(substituteMentions(chat.LastMessagePreview, m.chatMentionNames))
 	if lastPreview == "" {
 		lastPreview = "No messages yet"
 	}
