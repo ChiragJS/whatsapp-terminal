@@ -479,6 +479,7 @@ func (r *deterministicRand) intn(n int) int {
 	if n <= 0 {
 		return 0
 	}
+	// #nosec G115 -- the modulo result is < n, which is a positive int.
 	return int(r.next() % uint64(n))
 }
 
