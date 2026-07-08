@@ -151,6 +151,21 @@ func applyTheme(t Theme) {
 	peerNameStyle = lipgloss.NewStyle().Bold(true).Foreground(t.Amber)
 	youNameStyle = lipgloss.NewStyle().Bold(true).Foreground(t.Phosphor)
 	memberNameStyle = lipgloss.NewStyle().Bold(true).Foreground(t.Cyan)
+	mentionStyle = lipgloss.NewStyle().Bold(true).Foreground(t.Amber)
+	monoStyle = lipgloss.NewStyle().Foreground(t.Cyan)
+	// senderPalette gives each group member a stable color (picked by JID
+	// hash). Theme accents first, then fixed 256-color fills chosen to stay
+	// readable on dark backgrounds.
+	senderPalette = []lipgloss.Style{
+		lipgloss.NewStyle().Bold(true).Foreground(t.Cyan),
+		lipgloss.NewStyle().Bold(true).Foreground(t.Amber),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("84")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("210")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("179")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("111")),
+	}
 	timestampStyle = lipgloss.NewStyle().Foreground(t.Subtle)
 	receiptReadStyle = lipgloss.NewStyle().Foreground(t.Phosphor)
 	receiptDeliveredStyle = lipgloss.NewStyle().Foreground(t.Slate)

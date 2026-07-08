@@ -1,0 +1,315 @@
+package ui
+
+import (
+	"hash/fnv"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/chirag/whatsapp-terminal/internal/domain"
+)
+
+// WhatsApp inline markup: `mono`, *bold*, _italic_, ~strike~. Content must
+// not start or end with whitespace, mirroring how WhatsApp itself decides
+// whether delimiters format. Nested markup is not supported; the first
+// matching span wins.
+var inlineMarkup = regexp.MustCompile(
+	"`([^`\n]+)`" +
+		`|\*([^\s*](?:[^*\n]*[^\s*])?)\*` +
+		`|_([^\s_](?:[^_\n]*[^\s_])?)_` +
+		`|~([^\s~](?:[^~\n]*[^\s~])?)~`,
+)
+
+// mentionToken matches WhatsApp mentions as they appear in message text: an
+// @ followed by the numeric user part of the mentioned JID.
+var mentionToken = regexp.MustCompile(`^@(\d{6,20})(\W*)$`)
+
+type spanKind int
+
+const (
+	spanPlain spanKind = iota
+	spanMono
+	spanBold
+	spanItalic
+	spanStrike
+	spanMention
+)
+
+// styledWord is one whitespace-delimited word tagged with the markup span
+// it belongs to. Wrapping happens on words; rendering styles runs of
+// consecutive same-kind words as a single span, so styling never splits
+// mid-sequence and plain text stays contiguous in the output.
+type styledWord struct {
+	text string
+	kind spanKind
+}
+
+func spanStyle(kind spanKind) lipgloss.Style {
+	switch kind {
+	case spanMono:
+		return monoStyle
+	case spanBold:
+		return bodyStyle.Bold(true)
+	case spanItalic:
+		return bodyStyle.Italic(true)
+	case spanStrike:
+		return bodyStyle.Strikethrough(true)
+	case spanMention:
+		return mentionStyle
+	default:
+		return bodyStyle
+	}
+}
+
+func matchKind(groups []string) (string, spanKind) {
+	for idx, kind := range []spanKind{spanMono, spanBold, spanItalic, spanStrike} {
+		if groups[idx+1] != "" {
+			return groups[idx+1], kind
+		}
+	}
+	return groups[0], spanPlain
+}
+
+// parseMessageWords turns one paragraph of raw message text into styled
+// words: inline markup becomes styled spans and mention tokens resolve to
+// contact names.
+func parseMessageWords(paragraph string, mentions map[string]string) []styledWord {
+	var words []styledWord
+	appendWords := func(text string, kind spanKind) {
+		for _, word := range strings.Fields(text) {
+			words = append(words, resolveMentionWord(word, kind, mentions)...)
+		}
+	}
+
+	rest := paragraph
+	for rest != "" {
+		loc := inlineMarkup.FindStringSubmatchIndex(rest)
+		if loc == nil {
+			appendWords(rest, spanPlain)
+			break
+		}
+		appendWords(rest[:loc[0]], spanPlain)
+		groups := make([]string, 0, 5)
+		for g := 0; g <= 4; g++ {
+			if loc[2*g] < 0 {
+				groups = append(groups, "")
+				continue
+			}
+			groups = append(groups, rest[loc[2*g]:loc[2*g+1]])
+		}
+		content, kind := matchKind(groups)
+		appendWords(content, kind)
+		rest = rest[loc[1]:]
+	}
+	return words
+}
+
+// resolveMentionWord maps an "@123456789" token to "@Name" in the mention
+// style when the numeric user part is a known contact. Names may contain
+// spaces, so one token can expand to several styled words.
+func resolveMentionWord(word string, kind spanKind, mentions map[string]string) []styledWord {
+	match := mentionToken.FindStringSubmatch(word)
+	if match == nil {
+		return []styledWord{{text: word, kind: kind}}
+	}
+	name, ok := mentions[match[1]]
+	if !ok || name == "" {
+		return []styledWord{{text: word, kind: spanMention}}
+	}
+	parts := strings.Fields("@" + name)
+	words := make([]styledWord, 0, len(parts))
+	for _, part := range parts {
+		words = append(words, styledWord{text: part, kind: spanMention})
+	}
+	if trailing := match[2]; trailing != "" {
+		words[len(words)-1].text += trailing
+	}
+	return words
+}
+
+// renderMessageBody wraps a message body to width, applying WhatsApp inline
+// markup and mention resolution. Words wrap on plain-text widths and styling
+// is applied per same-kind run afterwards, so ANSI sequences never split
+// across wraps and unstyled text stays contiguous bytes.
+func renderMessageBody(text string, mentions map[string]string, width int) []string {
+	width = max(8, width)
+	var lines []string
+	for _, paragraph := range strings.Split(strings.TrimSpace(text), "\n") {
+		words := parseMessageWords(paragraph, mentions)
+		if len(words) == 0 {
+			lines = append(lines, "")
+			continue
+		}
+		var lineWords []styledWord
+		used := 0
+		flush := func() {
+			lines = append(lines, renderWordRuns(lineWords))
+			lineWords = nil
+			used = 0
+		}
+		for _, word := range words {
+			cells := ansi.StringWidth(word.text)
+			if cells > width {
+				if used > 0 {
+					flush()
+				}
+				lineWords = []styledWord{{text: truncateText(word.text, width), kind: word.kind}}
+				flush()
+				continue
+			}
+			if used > 0 && used+1+cells > width {
+				flush()
+			}
+			if used > 0 {
+				used++
+			}
+			lineWords = append(lineWords, word)
+			used += cells
+		}
+		if used > 0 {
+			flush()
+		}
+	}
+	return lines
+}
+
+// renderWordRuns renders one wrapped line, styling each run of consecutive
+// same-kind words as a single span so plain text stays contiguous bytes.
+func renderWordRuns(words []styledWord) string {
+	var b strings.Builder
+	for i := 0; i < len(words); {
+		j := i
+		for j < len(words) && words[j].kind == words[i].kind {
+			j++
+		}
+		texts := make([]string, 0, j-i)
+		for _, word := range words[i:j] {
+			texts = append(texts, word.text)
+		}
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(spanStyle(words[i].kind).Render(strings.Join(texts, " ")))
+		i = j
+	}
+	return b.String()
+}
+
+// receiptTicks renders delivery state as compact ticks on the message
+// header: ✓ sent, ✓✓ delivered, ✓✓ (accent) read.
+func receiptTicks(msg domain.Message) string {
+	if !msg.FromMe {
+		return ""
+	}
+	switch msg.Receipt {
+	case domain.ReceiptStateRead:
+		return receiptReadStyle.Render("✓✓")
+	case domain.ReceiptStateDelivered:
+		return receiptDeliveredStyle.Render("✓✓")
+	case domain.ReceiptStateSent:
+		return receiptSentStyle.Render("✓")
+	default:
+		return ""
+	}
+}
+
+// senderStyle returns a stable per-sender color for group messages so
+// members are visually distinguishable, like WhatsApp's colored names.
+func senderStyle(senderJID string) lipgloss.Style {
+	if len(senderPalette) == 0 {
+		return memberNameStyle
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(senderJID))
+	return senderPalette[int(h.Sum32())%len(senderPalette)]
+}
+
+// renderThreadMessage renders one message: a timestamp + sender + receipt
+// header, the formatted body, and an optional download annotation. Own
+// messages are right-aligned to read like a conversation.
+func renderThreadMessage(msg domain.Message, width int, mentions map[string]string) string {
+	width = max(18, width)
+	name := msg.SenderName
+	if name == "" {
+		name = msg.SenderJID
+	}
+	var nameStyle lipgloss.Style
+	switch {
+	case msg.FromMe:
+		name = "You"
+		nameStyle = youNameStyle
+	case msg.IsGroup:
+		nameStyle = senderStyle(msg.SenderJID)
+	default:
+		nameStyle = peerNameStyle
+	}
+	header := timestampStyle.Render(msg.Timestamp.Local().Format("15:04")) +
+		"  " + nameStyle.Render(truncateText(name, max(8, width-10)))
+	if ticks := receiptTicks(msg); ticks != "" {
+		header += "  " + ticks
+	}
+
+	lines := append([]string{header}, renderMessageBody(msg.Text, mentions, width)...)
+	if msg.DownloadedPath != "" {
+		lines = append(lines, subtleStyle.Render("↳ saved · "+truncateText(msg.DownloadedPath, max(8, width-10))))
+	}
+	if msg.FromMe {
+		for i, line := range lines {
+			if pad := width - ansi.StringWidth(line); pad > 0 {
+				lines[i] = strings.Repeat(" ", pad) + line
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// dateSeparator renders a "──  Mon, Jul 7  ──" divider line for day
+// boundaries in the thread.
+func dateSeparator(day, now time.Time, width int) string {
+	day = day.Local()
+	now = now.Local()
+	var label string
+	switch {
+	case sameDay(day, now):
+		label = "Today"
+	case sameDay(day.AddDate(0, 0, 1), now):
+		label = "Yesterday"
+	case day.Year() == now.Year():
+		label = day.Format("Mon, Jan 2")
+	default:
+		label = day.Format("Mon, Jan 2 2006")
+	}
+	side := max(2, (width-ansi.StringWidth(label)-4)/2)
+	rule := strings.Repeat("─", side)
+	return hairlineStyle.Render(rule) + "  " + subtleStyle.Render(label) + "  " + hairlineStyle.Render(rule)
+}
+
+// resolveMentionNames maps every mention token found in the given messages
+// to a contact name, trying the phone-number JID first and the LID alias
+// second. Unresolvable mentions are left out and render as raw tokens.
+func resolveMentionNames(lookup func(jid string) string, messages []domain.Message) map[string]string {
+	names := make(map[string]string)
+	pattern := regexp.MustCompile(`@(\d{6,20})`)
+	for _, msg := range messages {
+		for _, match := range pattern.FindAllStringSubmatch(msg.Text, -1) {
+			digits := match[1]
+			if _, seen := names[digits]; seen {
+				continue
+			}
+			name := lookup(digits + "@s.whatsapp.net")
+			if name == "" {
+				name = lookup(digits + "@lid")
+			}
+			if name != "" {
+				names[digits] = name
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}

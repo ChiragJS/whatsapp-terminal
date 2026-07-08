@@ -56,6 +56,9 @@ type chatsLoadedMsg struct {
 type messagesLoadedMsg struct {
 	chatJID  string
 	messages []domain.Message
+	// mentions maps the numeric user part of "@123…" mention tokens found
+	// in the loaded messages to contact names.
+	mentions map[string]string
 	limit    int
 	err      error
 }
@@ -150,6 +153,7 @@ type Model struct {
 
 	chats                []domain.ChatSummary
 	messages             []domain.Message
+	mentionNames         map[string]string
 	pendingAttachments   []stagedAttachment
 	pathSuggestions      []pathSuggestion
 	pathSuggestionIdx    int
@@ -377,6 +381,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.threadMessageLimit = messageLimit
 			}
 			m.messages = msg.messages
+			m.mentionNames = msg.mentions
 			newLineCount := len(m.threadMessageLines(lineWidth))
 			if wasAtBottom {
 				m.threadScroll = 0
@@ -555,6 +560,7 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = viewThread
 			m.currentChatID = chat.JID
 			m.messages = nil
+			m.mentionNames = nil
 			m.threadHistoryPending = false
 			m.threadLoadingOlder = false
 			m.threadMessageLimit = messageLimit
@@ -732,6 +738,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = viewChats
 		m.currentChatID = ""
 		m.messages = nil
+		m.mentionNames = nil
 		m.threadHistoryPending = false
 		m.threadLoadingOlder = false
 		m.threadMessageLimit = 0
@@ -1223,8 +1230,19 @@ func loadMessagesCmd(repo *appstore.Store, chatJID string, limit int) tea.Cmd {
 		limit = messageLimit
 	}
 	return func() tea.Msg {
-		messages, err := repo.ListMessages(context.Background(), chatJID, limit)
-		return messagesLoadedMsg{chatJID: chatJID, messages: messages, limit: limit, err: err}
+		ctx := context.Background()
+		messages, err := repo.ListMessages(ctx, chatJID, limit)
+		var mentions map[string]string
+		if err == nil {
+			mentions = resolveMentionNames(func(jid string) string {
+				name, lookupErr := repo.ContactName(ctx, jid)
+				if lookupErr != nil {
+					return ""
+				}
+				return name
+			}, messages)
+		}
+		return messagesLoadedMsg{chatJID: chatJID, messages: messages, mentions: mentions, limit: limit, err: err}
 	}
 }
 
@@ -1392,22 +1410,6 @@ func cycleSelection(selected, delta, total int) int {
 		selected += total
 	}
 	return selected
-}
-
-func receiptSuffix(msg domain.Message) string {
-	if !msg.FromMe {
-		return ""
-	}
-	switch msg.Receipt {
-	case domain.ReceiptStateRead:
-		return "  " + receiptReadStyle.Render("●") + " " + subtleStyle.Render("read")
-	case domain.ReceiptStateDelivered:
-		return "  " + receiptDeliveredStyle.Render("◐") + " " + subtleStyle.Render("delivered")
-	case domain.ReceiptStateSent:
-		return "  " + receiptSentStyle.Render("◌") + " " + subtleStyle.Render("sent")
-	default:
-		return ""
-	}
 }
 
 func renderQRCode(code string) string {
@@ -1829,47 +1831,24 @@ func actionRow(key, label string, width int) string {
 	return line
 }
 
-// renderThreadMessage renders one message as its display lines: a
-// timestamp+sender header, the wrapped body, and optional receipt and
-// download annotations.
-func renderThreadMessage(msg domain.Message, width int) string {
-	name := msg.SenderName
-	if name == "" {
-		name = msg.SenderJID
-	}
-	var nameStyle lipgloss.Style
-	switch {
-	case msg.FromMe:
-		name = "You"
-		nameStyle = youNameStyle
-	case msg.IsGroup:
-		nameStyle = memberNameStyle
-	default:
-		nameStyle = peerNameStyle
-	}
-	stamp := timestampStyle.Render(msg.Timestamp.Local().Format("15:04"))
-	who := nameStyle.Render(truncateText(name, max(8, width-10)))
-	text := stamp + "  " + who + "\n" + bodyStyle.Render(wrapText(msg.Text, width))
-	if suffix := receiptSuffix(msg); suffix != "" {
-		text += "\n" + strings.TrimSpace(suffix)
-	}
-	if msg.DownloadedPath != "" {
-		text += "\n" + subtleStyle.Render("↳ saved · "+filepath.Base(msg.DownloadedPath))
-	}
-	return text
-}
-
 // threadMessageLines flattens every cached message into display lines with a
-// blank separator between messages. The thread scroll offset is measured in
-// these lines, so scrolling is smooth and long messages are fully reachable.
+// blank separator between messages and a date divider at day boundaries.
+// The thread scroll offset is measured in these lines, so scrolling is
+// smooth and long messages are fully reachable.
 func (m Model) threadMessageLines(width int) []string {
 	width = max(18, width)
+	now := time.Now()
 	lines := make([]string, 0, len(m.messages)*3)
+	var previousDay time.Time
 	for i, msg := range m.messages {
 		if i > 0 {
 			lines = append(lines, "")
 		}
-		lines = append(lines, strings.Split(renderThreadMessage(msg, width), "\n")...)
+		if day := msg.Timestamp.Local(); i == 0 || !sameDay(day, previousDay) {
+			lines = append(lines, dateSeparator(day, now, width), "")
+			previousDay = day
+		}
+		lines = append(lines, strings.Split(renderThreadMessage(msg, width, m.mentionNames), "\n")...)
 	}
 	return lines
 }
@@ -2667,6 +2646,9 @@ var (
 	peerNameStyle            lipgloss.Style
 	youNameStyle             lipgloss.Style
 	memberNameStyle          lipgloss.Style
+	mentionStyle             lipgloss.Style
+	monoStyle                lipgloss.Style
+	senderPalette            []lipgloss.Style
 	timestampStyle           lipgloss.Style
 	receiptReadStyle         lipgloss.Style
 	receiptDeliveredStyle    lipgloss.Style
