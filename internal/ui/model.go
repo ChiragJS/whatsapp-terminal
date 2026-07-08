@@ -165,6 +165,7 @@ type Model struct {
 	clipboard clipboardReader
 	sounder   sounder
 	recorder  voiceRecorder
+	player    audioPlayer
 
 	chats                []domain.ChatSummary
 	messages             []domain.Message
@@ -217,6 +218,7 @@ func NewModel(repo *appstore.Store, transport domain.Transport) Model {
 		clipboard:     newSystemClipboard(),
 		sounder:       newTerminalBell(),
 		recorder:      newSystemVoiceRecorder(),
+		player:        newSystemAudioPlayer(),
 		downloadDir:   defaultDownloadDir(),
 		filePickerDir: defaultPickerDir(),
 		themeName:     currentTheme.Name,
@@ -244,6 +246,14 @@ func (m Model) WithSounder(sounder sounder) Model {
 func (m Model) WithRecorder(recorder voiceRecorder) Model {
 	if recorder != nil {
 		m.recorder = recorder
+	}
+	return m
+}
+
+// WithPlayer overrides the audio player. Nil keeps the current one.
+func (m Model) WithPlayer(player audioPlayer) Model {
+	if player != nil {
+		m.player = player
 	}
 	return m
 }
@@ -329,6 +339,9 @@ func (m Model) canQuitWithKey() bool {
 func (m Model) requestQuit() (tea.Model, tea.Cmd) {
 	if m.recordingVoice && m.recorder != nil {
 		_ = m.recorder.Cancel()
+	}
+	if m.player != nil {
+		_ = m.player.Stop()
 	}
 	m.clearPendingAttachments()
 	m.quitArmed = false
@@ -835,8 +848,30 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, downloadMediaCmd(m.transport, *latest, m.downloadDir)
+	case "p":
+		return m.toggleVoicePlayback()
 	}
 	return m, nil
+}
+
+// toggleVoicePlayback plays the latest voice note or audio message in the
+// thread (downloading it first when needed), or stops an active playback.
+func (m Model) toggleVoicePlayback() (tea.Model, tea.Cmd) {
+	if m.currentChatID == "" || m.player == nil {
+		return m, nil
+	}
+	if m.player.Playing() {
+		_ = m.player.Stop()
+		m.status = "Playback stopped"
+		return m, nil
+	}
+	latest := latestVoiceMessage(m.messages)
+	if latest == nil {
+		m.lastErr = "no voice notes or audio found in this thread"
+		return m, nil
+	}
+	m.status = "Starting playback..."
+	return m, playVoiceCmd(m.transport, m.player, *latest, m.downloadDir)
 }
 
 // abandonCompose leaves compose mode and discards the draft's transient
@@ -1073,7 +1108,8 @@ func (m Model) renderHelp() string {
 	})...)
 	left = append(left, section("Thread", [][2]string{
 		{"j/k", "scroll one line"}, {"pgup/pgdn", "scroll a page"}, {"home/end", "oldest · latest"},
-		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"}, {"esc", "back to inbox"},
+		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"},
+		{"p", "play · stop voice note"}, {"esc", "back to inbox"},
 	})...)
 	var right []string
 	right = append(right, section("Compose", [][2]string{
@@ -1109,7 +1145,7 @@ func (m Model) threadHelpText() string {
 		}
 		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
 	}
-	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download  ? help"
+	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download  p play  ? help"
 }
 
 func (m Model) currentChat() *domain.ChatSummary {
@@ -2337,6 +2373,50 @@ func (m Model) splitWidths(totalWidth int) (int, int) {
 		right = totalWidth - left - 1
 	}
 	return left, right
+}
+
+// latestVoiceMessage finds the newest voice note or audio message that is
+// already downloaded or still downloadable.
+func latestVoiceMessage(messages []domain.Message) *domain.Message {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		msg := messages[idx]
+		if msg.MediaKind != domain.MediaKindVoice && msg.MediaKind != domain.MediaKindAudio {
+			continue
+		}
+		if msg.DownloadedPath != "" || msg.MediaDirectPath != "" {
+			return &msg
+		}
+	}
+	return nil
+}
+
+// playVoiceCmd downloads the message's audio when it is not cached yet and
+// starts playback in the background.
+func playVoiceCmd(transport domain.Transport, player audioPlayer, msg domain.Message, downloadDir string) tea.Cmd {
+	return func() tea.Msg {
+		path := msg.DownloadedPath
+		downloaded := false
+		if path == "" {
+			target, err := transport.DownloadMedia(context.Background(), msg, downloadDir)
+			if err != nil {
+				return opResultMsg{err: err}
+			}
+			path = target
+			downloaded = true
+		}
+		if err := player.Play(path); err != nil {
+			return opResultMsg{err: err}
+		}
+		label := media.StatusLabel(msg.MediaKind)
+		if msg.MediaSeconds > 0 {
+			label = fmt.Sprintf("%s (%d:%02d)", label, msg.MediaSeconds/60, msg.MediaSeconds%60)
+		}
+		return opResultMsg{
+			status:  "Playing " + label + " — p to stop",
+			chatJID: msg.ChatJID,
+			refresh: downloaded,
+		}
+	}
 }
 
 func latestDownloadableMessage(messages []domain.Message) *domain.Message {

@@ -480,3 +480,135 @@ func TestFooterShowsTransportStatus(t *testing.T) {
 		t.Fatalf("footer must prioritize errors:\n%s", footer)
 	}
 }
+
+type fakeAudioPlayer struct {
+	playing    bool
+	playedPath string
+	stopped    bool
+	playErr    error
+}
+
+func (f *fakeAudioPlayer) Play(path string) error {
+	if f.playErr != nil {
+		return f.playErr
+	}
+	f.playedPath = path
+	f.playing = true
+	return nil
+}
+
+func (f *fakeAudioPlayer) Stop() error {
+	f.stopped = true
+	f.playing = false
+	return nil
+}
+
+func (f *fakeAudioPlayer) Playing() bool { return f.playing }
+
+func voiceThreadModel(t *testing.T, player audioPlayer, transport *fakeTransport, msg domain.Message) Model {
+	t.Helper()
+	repo := seededRepo(t)
+	m := NewModel(repo, transport).WithPlayer(player)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = msg.ChatJID
+	m.messages = []domain.Message{msg}
+	m.threadMessageLimit = messageLimit
+	return m
+}
+
+func TestPlayKeyPlaysDownloadedVoiceNote(t *testing.T) {
+	t.Parallel()
+
+	player := &fakeAudioPlayer{}
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := voiceThreadModel(t, player, transport, domain.Message{
+		ID: "v1", ChatJID: "alice@s.whatsapp.net", SenderJID: "alice@s.whatsapp.net",
+		Text: "[voice note]", MediaKind: domain.MediaKindVoice, MediaSeconds: 12,
+		DownloadedPath: "/tmp/voice.ogg",
+		Timestamp:      time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmd == nil {
+		t.Fatal("expected playback command")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("playback result = %#v", result)
+	}
+	if player.playedPath != "/tmp/voice.ogg" {
+		t.Fatalf("playedPath = %q, want cached download used directly", player.playedPath)
+	}
+	if transport.downloadedMessage != "" {
+		t.Fatal("cached voice note must not be downloaded again")
+	}
+	if !strings.Contains(result.status, "0:12") {
+		t.Fatalf("status = %q, want duration included", result.status)
+	}
+
+	// p again stops.
+	model := updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = updated.(Model)
+	if !player.stopped {
+		t.Fatal("expected second p to stop playback")
+	}
+	if model.status != "Playback stopped" {
+		t.Fatalf("status = %q, want Playback stopped", model.status)
+	}
+}
+
+func TestPlayKeyDownloadsVoiceNoteWhenNotCached(t *testing.T) {
+	t.Parallel()
+
+	player := &fakeAudioPlayer{}
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := voiceThreadModel(t, player, transport, domain.Message{
+		ID: "v2", ChatJID: "alice@s.whatsapp.net", SenderJID: "alice@s.whatsapp.net",
+		Text: "[voice note]", MediaKind: domain.MediaKindVoice,
+		MediaDirectPath: "/wa/media/v2",
+		Timestamp:       time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	})
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmd == nil {
+		t.Fatal("expected playback command")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("playback result = %#v", result)
+	}
+	if transport.downloadedMessage != "v2" {
+		t.Fatalf("downloadedMessage = %q, want v2 downloaded first", transport.downloadedMessage)
+	}
+	if player.playedPath == "" || !strings.HasSuffix(player.playedPath, "downloaded.bin") {
+		t.Fatalf("playedPath = %q, want the downloaded file", player.playedPath)
+	}
+	if !result.refresh {
+		t.Fatal("expected refresh so the saved-path annotation appears")
+	}
+}
+
+func TestPlayKeyWithoutVoiceMessagesSetsError(t *testing.T) {
+	t.Parallel()
+
+	player := &fakeAudioPlayer{}
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := voiceThreadModel(t, player, transport, domain.Message{
+		ID: "t1", ChatJID: "alice@s.whatsapp.net", SenderJID: "alice@s.whatsapp.net",
+		Text:      "just text",
+		Timestamp: time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model := updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect a command without playable audio")
+	}
+	if model.lastErr == "" {
+		t.Fatal("expected an error message when no voice notes exist")
+	}
+}
