@@ -20,6 +20,9 @@ func (m Model) scrollThread(delta int) (tea.Model, tea.Cmd) {
 		m.threadScroll = min(max(0, m.threadScroll+delta), m.maxThreadScroll())
 		stateChanged = previousScroll != m.threadScroll
 	}
+	if m.threadScroll == 0 {
+		m.threadNewWhileAway = 0
+	}
 
 	var cmd tea.Cmd
 	if delta > 0 && (len(m.messages) == 0 || m.threadNearOldestBoundary()) {

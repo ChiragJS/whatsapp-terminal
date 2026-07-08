@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"hash/fnv"
 	"regexp"
 	"strings"
@@ -201,6 +202,44 @@ func renderWordRuns(words []styledWord) string {
 	return b.String()
 }
 
+// mediaChip renders a compact metadata line for media messages:
+// "◆ voice · 0:12", "◆ document · brief.pdf · 2.1 MB".
+func mediaChip(msg domain.Message, width int) string {
+	if msg.MediaKind == domain.MediaKindNone {
+		return ""
+	}
+	parts := []string{string(msg.MediaKind)}
+	if msg.MediaFileName != "" {
+		parts = append(parts, msg.MediaFileName)
+	}
+	if msg.MediaSeconds > 0 {
+		parts = append(parts, fmt.Sprintf("%d:%02d", msg.MediaSeconds/60, msg.MediaSeconds%60))
+	}
+	if msg.MediaFileLength > 0 {
+		parts = append(parts, humanFileSize(msg.MediaFileLength))
+	}
+	chip := chipKeyStyle.Render("◆") + " " + chipLabelStyle.Render(strings.Join(parts, " · "))
+	return truncateText(chip, max(12, width))
+}
+
+func humanFileSize(bytes uint64) string {
+	switch {
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// isMediaPlaceholderText reports whether the message text is just the
+// bracketed media placeholder ("[image]", "[voice note] rec.ogg"), in which
+// case the media chip already carries all its information.
+func isMediaPlaceholderText(msg domain.Message) bool {
+	return msg.MediaKind != domain.MediaKindNone && strings.HasPrefix(strings.TrimSpace(msg.Text), "[")
+}
+
 // receiptTicks renders delivery state as compact ticks on the message
 // header: ✓ sent, ✓✓ delivered, ✓✓ (accent) read.
 func receiptTicks(msg domain.Message) string {
@@ -255,7 +294,13 @@ func renderThreadMessage(msg domain.Message, width int, mentions map[string]stri
 		header += "  " + ticks
 	}
 
-	lines := append([]string{header}, renderMessageBody(msg.Text, mentions, width)...)
+	lines := []string{header}
+	if !isMediaPlaceholderText(msg) {
+		lines = append(lines, renderMessageBody(msg.Text, mentions, width)...)
+	}
+	if chip := mediaChip(msg, width); chip != "" {
+		lines = append(lines, chip)
+	}
 	if msg.DownloadedPath != "" {
 		lines = append(lines, subtleStyle.Render("↳ saved · "+truncateText(msg.DownloadedPath, max(8, width-10))))
 	}

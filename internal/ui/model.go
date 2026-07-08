@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -33,7 +34,7 @@ const (
 	threadMouseScroll    = 3
 	maxPathSuggestions   = 5
 	chatItemLineCount    = 2
-	chatListHelpText     = "j/k move  enter open  / search  r refresh  T theme  esc·q quit"
+	chatListHelpText     = "j/k move  enter open  / search  r refresh  T theme  ? help  esc·q quit"
 	smallCapRuleMargin   = 6
 )
 
@@ -47,6 +48,15 @@ const (
 type transportEventMsg struct {
 	event domain.Event
 }
+
+// spinnerTickMsg advances the sync spinner animation.
+type spinnerTickMsg struct{}
+
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 type chatsLoadedMsg struct {
 	chats []domain.ChatSummary
@@ -139,6 +149,9 @@ type Model struct {
 	filePickerOpen bool
 	recordingVoice bool
 	stoppingVoice  bool
+	helpOpen       bool
+	spinnerActive  bool
+	spinnerFrame   int
 	selected       int
 	chatListOffset int
 	currentChatID  string
@@ -168,6 +181,7 @@ type Model struct {
 	threadLoadingOlder   bool
 	threadMessageLimit   int
 	threadScroll         int
+	threadNewWhileAway   int
 	quitArmed            bool
 	quitAfterNavigation  bool
 	dataDir              string
@@ -333,6 +347,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case transportEventMsg:
 		m = m.applyTransportEvent(msg.event)
 		cmds := []tea.Cmd{waitForTransportEvent(m.events), m.loadChats(m.search.Value())}
+		if m.syncingRecent && !m.spinnerActive {
+			m.spinnerActive = true
+			cmds = append(cmds, spinnerTickCmd())
+		}
 		if m.currentChatID != "" {
 			cmds = append(cmds, loadMessagesCmd(m.repo, m.currentChatID, m.messageLoadLimit()))
 		}
@@ -384,6 +402,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.threadMessageLimit == 0 {
 				m.threadMessageLimit = messageLimit
 			}
+			previousCount := len(m.messages)
 			m.messages = msg.messages
 			m.mentionNames = msg.mentions
 			newLineCount := len(m.threadMessageLines(lineWidth))
@@ -391,10 +410,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.threadScroll = 0
 			} else if previousNewestID != "" && newestMessageID(msg.messages) != previousNewestID && newLineCount > previousLineCount {
 				// New messages appended at the bottom while scrolled up:
-				// grow the offset so the view keeps showing the same lines.
+				// grow the offset so the view keeps showing the same lines,
+				// and count them for the "N new" hint.
 				m.threadScroll += newLineCount - previousLineCount
+				m.threadNewWhileAway += max(0, len(msg.messages)-previousCount)
 			}
 			m.threadScroll = min(max(0, m.threadScroll), m.maxThreadScroll())
+			if m.threadScroll == 0 {
+				m.threadNewWhileAway = 0
+			}
 			if len(msg.messages) == 0 && m.mode == viewThread && !m.threadHistoryPending {
 				var cmd tea.Cmd
 				m, cmd = m.loadOlderThreadMessages()
@@ -440,6 +464,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 		}
 		return m, nil
+	case spinnerTickMsg:
+		if !m.syncingRecent {
+			m.spinnerActive = false
+			return m, nil
+		}
+		m.spinnerFrame++
+		return m, spinnerTickCmd()
 	case attachmentStagedMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
@@ -458,7 +489,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshPathSuggestions()
 		return m, nil
 	case tea.KeyMsg:
+		if m.helpOpen {
+			switch msg.String() {
+			case "ctrl+c":
+				return m.requestQuit()
+			case "esc", "q", "?", "enter":
+				m.helpOpen = false
+			}
+			return m, nil
+		}
 		switch msg.String() {
+		case "?":
+			// Not while typing: "?" must stay typeable in search and compose.
+			if m.canQuitWithKey() {
+				m.helpOpen = true
+				return m, nil
+			}
 		case "ctrl+c":
 			return m.requestQuit()
 		case "ctrl+l":
@@ -491,6 +537,9 @@ func (m Model) View() string {
 	if m.qrCode != "" {
 		rendered = m.renderPairing()
 		return m.fitFrame(rendered)
+	}
+	if m.helpOpen {
+		return m.fitFrame(m.renderHelp())
 	}
 
 	switch m.mode {
@@ -565,6 +614,7 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentChatID = chat.JID
 			m.messages = nil
 			m.mentionNames = nil
+			m.threadNewWhileAway = 0
 			m.threadHistoryPending = false
 			m.threadLoadingOlder = false
 			m.threadMessageLimit = messageLimit
@@ -743,6 +793,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.currentChatID = ""
 		m.messages = nil
 		m.mentionNames = nil
+		m.threadNewWhileAway = 0
 		m.threadHistoryPending = false
 		m.threadLoadingOlder = false
 		m.threadMessageLimit = 0
@@ -765,6 +816,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.scrollThread(max(1, m.maxThreadScroll()))
 	case "end":
 		m.threadScroll = 0
+		m.threadNewWhileAway = 0
 		return m, nil
 	case "u":
 		if m.currentChatID == "" {
@@ -943,7 +995,14 @@ func (m Model) threadLayout() threadViewLayout {
 }
 
 func (m Model) renderThread() string {
-	header := m.renderHeader(m.threadTitle(), "")
+	subtitle := ""
+	if m.threadScroll > 0 {
+		subtitle = "↑ history"
+		if m.threadNewWhileAway > 0 {
+			subtitle = fmt.Sprintf("↓ %d new", m.threadNewWhileAway)
+		}
+	}
+	header := m.renderHeader(m.threadTitle(), subtitle)
 	footer := m.renderFooter(m.threadHelpText())
 	if m.composing {
 		contentWidth := max(48, m.width-2)
@@ -951,10 +1010,96 @@ func (m Model) renderThread() string {
 		m.resizeComposer(contentWidth-boxMutedStyle.GetHorizontalFrameSize(), max(3, bodyHeight/3))
 	}
 	layout := m.threadLayout()
-	messages := renderPanel(boxStyle, layout.contentWidth, layout.messageHeight,
-		m.threadBody(paddedContentHeight(layout.messageHeight), layout.contentWidth-boxStyle.GetHorizontalFrameSize()))
+	viewport := paddedContentHeight(layout.messageHeight)
+	lineWidth := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
+	messages := renderPanel(boxStyle, layout.contentWidth, layout.messageHeight, m.threadBody(viewport, lineWidth))
+	messages = m.overlayScrollThumb(messages, viewport, lineWidth)
 	composer := renderPanel(boxMutedStyle, layout.contentWidth, layout.composerHeight, layout.composerContent)
 	return lipgloss.JoinVertical(lipgloss.Left, header, messages, composer, footer)
+}
+
+// overlayScrollThumb draws a scroll-position thumb onto the right border of
+// the rendered messages panel. Nothing is drawn when the whole thread fits.
+func (m Model) overlayScrollThumb(panel string, viewport, lineWidth int) string {
+	total := len(m.threadMessageLines(lineWidth))
+	maxScroll := max(0, total-viewport)
+	if maxScroll == 0 {
+		return panel
+	}
+	lines := strings.Split(panel, "\n")
+	inner := len(lines) - 2
+	if inner < 2 {
+		return panel
+	}
+	scroll := min(max(0, m.threadScroll), maxScroll)
+	thumb := max(1, inner*viewport/total)
+	if thumb >= inner {
+		return panel
+	}
+	// scroll counts lines up from the bottom: scroll 0 pins the thumb to
+	// the bottom of the track, maxScroll to the top.
+	track := inner - thumb
+	top := track - (track*scroll+maxScroll/2)/maxScroll
+	for i := top; i < top+thumb && i+1 < len(lines)-1; i++ {
+		row := i + 1
+		width := lipgloss.Width(lines[row])
+		lines[row] = ansi.Truncate(lines[row], width-1, "") + railStyle.Render("█")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderHelp draws the full-screen keybinding reference opened with "?".
+func (m Model) renderHelp() string {
+	header := m.renderHeader("Help", "")
+	footer := m.renderFooter("? or esc close  ctrl+c quit")
+	contentWidth := max(48, m.width-2)
+	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
+	innerWidth := contentWidth - boxStyle.GetHorizontalFrameSize()
+
+	// Two columns so all four sections fit typical terminal heights.
+	columnWidth := max(20, (innerWidth-4)/2)
+	section := func(title string, rows [][2]string) []string {
+		lines := []string{smallCap(title, columnWidth)}
+		for _, row := range rows {
+			lines = append(lines, actionRow(row[0], row[1], columnWidth))
+		}
+		lines = append(lines, "")
+		return lines
+	}
+	var left []string
+	left = append(left, section("Inbox", [][2]string{
+		{"j/k", "move selection"}, {"enter", "open thread"}, {"/", "filter inbox"},
+		{"r", "reload cache"}, {"T", "cycle theme"}, {"esc·q", "quit"},
+	})...)
+	left = append(left, section("Thread", [][2]string{
+		{"j/k", "scroll one line"}, {"pgup/pgdn", "scroll a page"}, {"home/end", "oldest · latest"},
+		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"}, {"esc", "back to inbox"},
+	})...)
+	var right []string
+	right = append(right, section("Compose", [][2]string{
+		{"enter", "send"}, {"ctrl+j", "newline"}, {"ctrl+o", "file picker"},
+		{"ctrl+v", "paste clipboard image"}, {"alt+v", "record voice note"}, {"tab", "path suggestions"}, {"esc", "cancel draft"},
+	})...)
+	right = append(right, section("Global", [][2]string{
+		{"?", "this help"}, {"ctrl+l", "force repaint"}, {"ctrl+c", "quit"},
+	})...)
+
+	rows := max(len(left), len(right))
+	body := make([]string, 0, rows)
+	for i := 0; i < rows; i++ {
+		leftCell, rightCell := "", ""
+		if i < len(left) {
+			leftCell = left[i]
+		}
+		if i < len(right) {
+			rightCell = right[i]
+		}
+		pad := max(0, columnWidth-ansi.StringWidth(leftCell))
+		body = append(body, leftCell+strings.Repeat(" ", pad)+"    "+rightCell)
+	}
+
+	panel := renderPanel(boxStyle, contentWidth, bodyHeight, strings.Join(body, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Left, header, panel, footer)
 }
 
 func (m Model) threadHelpText() string {
@@ -964,7 +1109,7 @@ func (m Model) threadHelpText() string {
 		}
 		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
 	}
-	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download"
+	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download  ? help"
 }
 
 func (m Model) currentChat() *domain.ChatSummary {
@@ -1507,7 +1652,7 @@ func (m Model) statusIndicator() (string, string) {
 	case m.lastErr != "" && !m.ready:
 		return statusDotErrStyle.Render("●"), "offline"
 	case m.syncingRecent:
-		return statusDotWarnStyle.Render("●"), "syncing"
+		return statusDotWarnStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]), "syncing"
 	case m.ready:
 		return statusDotOnStyle.Render("●"), "live"
 	default:
@@ -1524,8 +1669,11 @@ func (m Model) renderFooter(help string) string {
 	// fully overwrite the upper panels — otherwise a longer previous frame
 	// (with an error) leaves stale cells when the error clears.
 	statusLine := ""
-	if m.lastErr != "" {
+	switch {
+	case m.lastErr != "":
 		statusLine = errorStyle.Render("✕ ") + slateStyle.Render(truncateText(m.lastErr, max(10, width-4)))
+	case strings.TrimSpace(m.status) != "":
+		statusLine = subtleStyle.Render(truncateText(m.status, max(10, width-2)))
 	}
 	return strings.Join([]string{
 		rule,
@@ -1685,9 +1833,10 @@ func renderChatItem(chat domain.ChatSummary, width int, selected bool, mentions 
 		railCol = railStyle.Render("▌") + " "
 		titleStyleApplied = selectedItemStyle
 	}
+	monogram := senderStyle(chat.JID).Render(chatMonogram(displayChatTitle(chat))) + " "
 	// Leave a generous safety margin so styled segments do not wrap on
 	// lipgloss's stricter visual-width measurement (combining marks, padding).
-	contentWidth := width - 6
+	contentWidth := width - 6 - 3 // rail/margins, then "XY " monogram
 
 	unread := ""
 	if chat.UnreadCount > 0 {
@@ -1709,7 +1858,7 @@ func renderChatItem(chat domain.ChatSummary, width int, selected bool, mentions 
 	title := truncateText(displayChatTitle(chat), max(4, titleMax))
 	titleRendered := titleStyleApplied.Render(title)
 	topGap := max(1, contentWidth-lipgloss.Width(titleRendered)-lipgloss.Width(unread))
-	topLine := railCol + titleRendered + strings.Repeat(" ", topGap) + unread
+	topLine := railCol + monogram + titleRendered + strings.Repeat(" ", topGap) + unread
 
 	// Bottom line: preview left, relative time right.
 	preview := collapseWhitespace(substituteMentions(chat.LastMessagePreview, mentions))
@@ -1731,11 +1880,36 @@ func renderChatItem(chat domain.ChatSummary, width int, selected bool, mentions 
 	preview = truncateText(preview, previewMax)
 	previewRendered := mutedStyle.Render(preview)
 	botGap := max(1, contentWidth-lipgloss.Width(previewRendered)-lipgloss.Width(timeRendered))
-	botLine := "  " + previewRendered + strings.Repeat(" ", botGap) + timeRendered
+	botLine := "     " + previewRendered + strings.Repeat(" ", botGap) + timeRendered
 
 	// Defensive clamp: every item must be exactly two visible lines. If any
 	// upstream styled segment ever emits an embedded newline, drop the tail.
 	return clampToLines(topLine+"\n"+botLine, 2)
+}
+
+// chatMonogram derives a fixed two-cell initial block from a chat title
+// ("Sonu Asansol" -> "SA"), used as a colored poor-man's avatar.
+func chatMonogram(title string) string {
+	var initials []rune
+	for _, field := range strings.Fields(title) {
+		for _, r := range field {
+			if unicode.IsLetter(r) || unicode.IsNumber(r) {
+				initials = append(initials, unicode.ToUpper(r))
+			}
+			break
+		}
+		if len(initials) == 2 {
+			break
+		}
+	}
+	switch len(initials) {
+	case 0:
+		return "· "
+	case 1:
+		return string(initials) + " "
+	default:
+		return string(initials)
+	}
 }
 
 func clampToLines(s string, n int) string {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
@@ -303,5 +304,179 @@ func TestLoadChatsCmdResolvesPreviewMentions(t *testing.T) {
 	view := plain(model.View())
 	if !strings.Contains(view, "@Sarthak") {
 		t.Fatalf("chat list view missing resolved mention:\n%s", view)
+	}
+}
+
+func TestChatMonogramDerivesInitials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ title, want string }{
+		{"Sonu Asansol", "SA"},
+		{"Mom", "M "},
+		{"8th Mile Website", "8M"},
+		{"", "· "},
+		{"— —", "· "},
+	}
+	for _, tt := range tests {
+		if got := chatMonogram(tt.title); got != tt.want {
+			t.Fatalf("chatMonogram(%q) = %q, want %q", tt.title, got, tt.want)
+		}
+	}
+}
+
+func TestMediaChipShowsDurationAndSize(t *testing.T) {
+	t.Parallel()
+
+	voice := domain.Message{
+		ID: "v1", ChatJID: "a@s.whatsapp.net", SenderJID: "a@s.whatsapp.net",
+		Text: "[voice note]", MediaKind: domain.MediaKindVoice, MediaSeconds: 72,
+		Timestamp: time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	}
+	out := plain(renderThreadMessage(voice, 60, nil))
+	if !strings.Contains(out, "voice · 1:12") {
+		t.Fatalf("voice message missing duration chip:\n%s", out)
+	}
+	if strings.Contains(out, "[voice note]") {
+		t.Fatalf("placeholder text should be replaced by the chip:\n%s", out)
+	}
+
+	doc := domain.Message{
+		ID: "d1", ChatJID: "a@s.whatsapp.net", SenderJID: "a@s.whatsapp.net",
+		Text: "[document] brief.pdf", MediaKind: domain.MediaKindDocument,
+		MediaFileName: "brief.pdf", MediaFileLength: 2202009,
+		Timestamp: time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	}
+	out = plain(renderThreadMessage(doc, 60, nil))
+	if !strings.Contains(out, "document · brief.pdf · 2.1 MB") {
+		t.Fatalf("document message missing metadata chip:\n%s", out)
+	}
+}
+
+func TestScrollThumbAppearsOnlyWhenScrollable(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 60)
+	m.threadMessageLimit = messageLimit
+
+	if !strings.Contains(m.renderThread(), "█") {
+		t.Fatal("expected scroll thumb on a long thread")
+	}
+
+	m.messages = makeThreadMessages(m.currentChatID, 1)
+	if strings.Contains(m.renderThread(), "█") {
+		t.Fatal("did not expect a scroll thumb when the thread fits")
+	}
+}
+
+func TestNewMessageHintWhileScrolledUp(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 40)
+	m.threadMessageLimit = messageLimit
+	m.threadScroll = 20
+
+	grown := makeThreadMessages(m.currentChatID, 42)
+	updated, _ := m.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: grown, limit: messageLimit})
+	model := updated.(Model)
+	if model.threadNewWhileAway != 2 {
+		t.Fatalf("threadNewWhileAway = %d, want 2", model.threadNewWhileAway)
+	}
+	if view := plain(model.renderThread()); !strings.Contains(view, "2 NEW") && !strings.Contains(view, "2 new") {
+		t.Fatalf("thread header missing new-message hint:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model = updated.(Model)
+	if model.threadNewWhileAway != 0 {
+		t.Fatalf("threadNewWhileAway after end = %d, want 0", model.threadNewWhileAway)
+	}
+}
+
+func TestHelpOverlayOpensAndCloses(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 30
+	m.ready = true
+	m.chats = makeChatSummaries(3)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	model := updated.(Model)
+	if !model.helpOpen {
+		t.Fatal("expected ? to open the help overlay")
+	}
+	view := plain(model.View())
+	for _, want := range []string{"Inbox", "Thread", "Compose", "Global", "force repaint"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("help view missing %q:\n%s", want, view)
+		}
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.helpOpen {
+		t.Fatal("expected esc to close the help overlay")
+	}
+	if model.quitArmed {
+		t.Fatal("closing help must not arm quit")
+	}
+}
+
+func TestSyncSpinnerTicksWhileSyncing(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.syncingRecent = true
+
+	updated, cmd := m.Update(spinnerTickMsg{})
+	model := updated.(Model)
+	if model.spinnerFrame != 1 || cmd == nil {
+		t.Fatalf("spinner frame = %d, cmd nil = %v; want advancing tick", model.spinnerFrame, cmd == nil)
+	}
+
+	model.syncingRecent = false
+	updated, cmd = model.Update(spinnerTickMsg{})
+	model = updated.(Model)
+	if model.spinnerActive || cmd != nil {
+		t.Fatal("spinner must stop once syncing completes")
+	}
+}
+
+func TestFooterShowsTransportStatus(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.status = "History sync updated"
+
+	if footer := plain(m.renderFooter(chatListHelpText)); !strings.Contains(footer, "History sync updated") {
+		t.Fatalf("footer missing status line:\n%s", footer)
+	}
+	m.lastErr = "boom"
+	if footer := plain(m.renderFooter(chatListHelpText)); !strings.Contains(footer, "boom") {
+		t.Fatalf("footer must prioritize errors:\n%s", footer)
 	}
 }
