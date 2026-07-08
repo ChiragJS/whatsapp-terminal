@@ -32,6 +32,10 @@ type fakeTransport struct {
 	downloadedDir     string
 	historyChat       string
 	historyCount      int
+
+	reactionTargetSender string
+	reactionTargetID     string
+	reactionEmoji        string
 }
 
 type fakeClipboard struct {
@@ -78,6 +82,13 @@ func (f *fakeTransport) SendVoiceNote(_ context.Context, chatJID, path string, d
 	f.sentChatJID = chatJID
 	f.sentVoice = path
 	f.sentVoiceDuration = duration
+	return nil
+}
+func (f *fakeTransport) SendReaction(_ context.Context, chatJID, targetSenderJID, targetMessageID, emoji string) error {
+	f.sentChatJID = chatJID
+	f.reactionTargetSender = targetSenderJID
+	f.reactionTargetID = targetMessageID
+	f.reactionEmoji = emoji
 	return nil
 }
 func (f *fakeTransport) DownloadMedia(_ context.Context, msg domain.Message, dir string) (string, error) {

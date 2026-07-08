@@ -560,6 +560,12 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 	if err != nil {
 		sender = evt.Info.Sender.ToNonAD()
 	}
+	if reaction := evt.Message.GetReactionMessage(); reaction != nil {
+		if evt.Info.IsFromMe {
+			sender = a.selfJID()
+		}
+		return a.recordReaction(ctx, chatJID, sender, reaction, evt.Info.Timestamp)
+	}
 	msg := domain.Message{
 		ID:         evt.Info.ID,
 		ChatJID:    chatJID.String(),
@@ -598,6 +604,61 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 
 func ignoredChatJID(jid string) bool {
 	return jid == "status@broadcast"
+}
+
+// recordReaction applies an incoming reaction (or removal, when the text is
+// empty) to the reactions table. Reactions never create message rows, bump
+// unread counts, or ring the bell — they are state changes on an existing
+// message.
+func (a *Adapter) recordReaction(ctx context.Context, chatJID, sender types.JID, reaction *waE2E.ReactionMessage, fallback time.Time) error {
+	targetID := reaction.GetKey().GetID()
+	if targetID == "" {
+		return nil
+	}
+	senderTS := reaction.GetSenderTimestampMS()
+	if senderTS == 0 {
+		senderTS = fallback.UnixMilli()
+	}
+	if err := a.repo.UpsertReaction(ctx, domain.Reaction{
+		ChatJID:   chatJID.String(),
+		TargetID:  targetID,
+		SenderJID: sender.String(),
+		Emoji:     strings.TrimSpace(reaction.GetText()),
+		SenderTS:  senderTS,
+	}); err != nil {
+		return err
+	}
+	a.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID.String()})
+	return nil
+}
+
+// SendReaction reacts to a message on WhatsApp and mirrors the state
+// locally. An empty emoji removes this device's reaction.
+func (a *Adapter) SendReaction(ctx context.Context, chatJID, targetSenderJID, targetMessageID, emoji string) error {
+	client := a.clientRef()
+	if client == nil {
+		return errors.New("client is not ready")
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return fmt.Errorf("parse chat JID: %w", err)
+	}
+	targetSender, err := types.ParseJID(targetSenderJID)
+	if err != nil {
+		return fmt.Errorf("parse target sender JID: %w", err)
+	}
+	if _, err := client.SendMessage(ctx, chat, client.BuildReaction(chat, targetSender, targetMessageID, emoji)); err != nil {
+		return fmt.Errorf("send reaction: %w", err)
+	}
+	canonicalChat, err := a.canonicalUserJID(ctx, chat)
+	if err != nil {
+		canonicalChat = chat.ToNonAD()
+	}
+	return a.recordReaction(ctx, canonicalChat, a.selfJID(), &waE2E.ReactionMessage{
+		Key:               client.BuildMessageKey(chat, targetSender, targetMessageID),
+		Text:              proto.String(emoji),
+		SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+	}, time.Now())
 }
 
 func (a *Adapter) handleReceipt(ctx context.Context, evt *waevents.Receipt) error {
@@ -835,6 +896,13 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 			if err != nil {
 				sender = parsed.Info.Sender.ToNonAD()
 			}
+			if reaction := parsed.Message.GetReactionMessage(); reaction != nil {
+				if parsed.Info.IsFromMe {
+					sender = a.selfJID()
+				}
+				_ = a.recordReaction(ctx, chatJID, sender, reaction, parsed.Info.Timestamp)
+				return domain.Message{}, false
+			}
 			if !parsed.Info.IsFromMe && parsed.Info.PushName != "" {
 				_ = a.repo.UpsertContact(ctx, domain.Contact{
 					JID:      sender.String(),
@@ -875,6 +943,10 @@ func (a *Adapter) historyMessageToDomain(ctx context.Context, chatJID types.JID,
 	}
 	if canonical, err := a.canonicalUserJID(ctx, sender.ToNonAD()); err == nil {
 		sender = canonical
+	}
+	if reaction := message.GetReactionMessage(); reaction != nil {
+		_ = a.recordReaction(ctx, chatJID, sender.ToNonAD(), reaction, unixTimeFromUint64(webMsg.GetMessageTimestamp()))
+		return domain.Message{}, false
 	}
 	msg := domain.Message{
 		ID:         key.GetID(),

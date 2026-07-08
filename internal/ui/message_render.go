@@ -269,10 +269,38 @@ func senderStyle(senderJID string) lipgloss.Style {
 	return senderPalette[int(h.Sum32())%len(senderPalette)]
 }
 
+// reactionLine aggregates a message's reactions into one compact line:
+// names when one or two people reacted, counts beyond that.
+func reactionLine(msg domain.Message, width int) string {
+	if len(msg.Reactions) == 0 {
+		return ""
+	}
+	order := make([]string, 0, len(msg.Reactions))
+	counts := make(map[string]int, len(msg.Reactions))
+	names := make(map[string][]string, len(msg.Reactions))
+	for _, reaction := range msg.Reactions {
+		if counts[reaction.Emoji] == 0 {
+			order = append(order, reaction.Emoji)
+		}
+		counts[reaction.Emoji]++
+		names[reaction.Emoji] = append(names[reaction.Emoji], displaySenderLabel(reaction.SenderName))
+	}
+	parts := make([]string, 0, len(order))
+	for _, emoji := range order {
+		if len(msg.Reactions) <= 2 {
+			parts = append(parts, emoji+" "+strings.Join(names[emoji], ", "))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s %d", emoji, counts[emoji]))
+	}
+	return truncateText(subtleStyle.Render(strings.Join(parts, " · ")), max(12, width))
+}
+
 // renderThreadMessage renders one message: a timestamp + sender + receipt
-// header, the formatted body, and an optional download annotation. Own
-// messages are right-aligned to read like a conversation.
-func renderThreadMessage(msg domain.Message, width int, mentions map[string]string) string {
+// header, the formatted body, reactions, and an optional download
+// annotation. Own messages are right-aligned to read like a conversation.
+// selected marks the react-mode cursor.
+func renderThreadMessage(msg domain.Message, width int, mentions map[string]string, selected bool) string {
 	width = max(18, width)
 	name := msg.SenderName
 	if name == "" {
@@ -293,6 +321,9 @@ func renderThreadMessage(msg domain.Message, width int, mentions map[string]stri
 	if ticks := receiptTicks(msg); ticks != "" {
 		header += "  " + ticks
 	}
+	if selected {
+		header = railStyle.Render("▌ ") + header
+	}
 
 	lines := []string{header}
 	if !isMediaPlaceholderText(msg) {
@@ -300,6 +331,9 @@ func renderThreadMessage(msg domain.Message, width int, mentions map[string]stri
 	}
 	if chip := mediaChip(msg, width); chip != "" {
 		lines = append(lines, chip)
+	}
+	if reactions := reactionLine(msg, width); reactions != "" {
+		lines = append(lines, reactions)
 	}
 	if msg.DownloadedPath != "" {
 		lines = append(lines, subtleStyle.Render("↳ saved · "+truncateText(msg.DownloadedPath, max(8, width-10))))

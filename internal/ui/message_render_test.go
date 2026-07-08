@@ -161,7 +161,7 @@ func TestRenderThreadMessageAlignsOwnMessagesRight(t *testing.T) {
 		FromMe:    true,
 		Receipt:   domain.ReceiptStateRead,
 	}
-	for idx, line := range strings.Split(renderThreadMessage(msg, width, nil), "\n") {
+	for idx, line := range strings.Split(renderThreadMessage(msg, width, nil, false), "\n") {
 		if strings.TrimSpace(plain(line)) == "" {
 			continue
 		}
@@ -174,7 +174,7 @@ func TestRenderThreadMessageAlignsOwnMessagesRight(t *testing.T) {
 	msg.SenderJID = "alice@s.whatsapp.net"
 	msg.SenderName = "Alice"
 	msg.Receipt = domain.ReceiptStateReceived
-	first := strings.Split(renderThreadMessage(msg, width, nil), "\n")[0]
+	first := strings.Split(renderThreadMessage(msg, width, nil, false), "\n")[0]
 	if strings.HasPrefix(plain(first), " ") {
 		t.Fatalf("peer message should stay left-aligned: %q", plain(first))
 	}
@@ -192,7 +192,7 @@ func TestReceiptTicksReplaceSuffixLine(t *testing.T) {
 		FromMe:    true,
 		Receipt:   domain.ReceiptStateDelivered,
 	}
-	rendered := renderThreadMessage(msg, 60, nil)
+	rendered := renderThreadMessage(msg, 60, nil, false)
 	if lines := strings.Split(rendered, "\n"); len(lines) != 2 {
 		t.Fatalf("rendered %d lines, want 2 (header with ticks + body):\n%s", len(lines), plain(rendered))
 	}
@@ -332,7 +332,7 @@ func TestMediaChipShowsDurationAndSize(t *testing.T) {
 		Text: "[voice note]", MediaKind: domain.MediaKindVoice, MediaSeconds: 72,
 		Timestamp: time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
 	}
-	out := plain(renderThreadMessage(voice, 60, nil))
+	out := plain(renderThreadMessage(voice, 60, nil, false))
 	if !strings.Contains(out, "voice · 1:12") {
 		t.Fatalf("voice message missing duration chip:\n%s", out)
 	}
@@ -346,7 +346,7 @@ func TestMediaChipShowsDurationAndSize(t *testing.T) {
 		MediaFileName: "brief.pdf", MediaFileLength: 2202009,
 		Timestamp: time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
 	}
-	out = plain(renderThreadMessage(doc, 60, nil))
+	out = plain(renderThreadMessage(doc, 60, nil, false))
 	if !strings.Contains(out, "document · brief.pdf · 2.1 MB") {
 		t.Fatalf("document message missing metadata chip:\n%s", out)
 	}
@@ -610,5 +610,123 @@ func TestPlayKeyWithoutVoiceMessagesSetsError(t *testing.T) {
 	}
 	if model.lastErr == "" {
 		t.Fatal("expected an error message when no voice notes exist")
+	}
+}
+
+func TestReactionLineAggregatesNamesAndCounts(t *testing.T) {
+	t.Parallel()
+
+	msg := domain.Message{
+		ID: "m1", ChatJID: "g@g.us", SenderJID: "b@s.whatsapp.net", Text: "sticker",
+		Timestamp: time.Date(2026, 7, 8, 14, 42, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived, IsGroup: true,
+		Reactions: []domain.Reaction{
+			{Emoji: "😂", SenderName: "Shashwat"},
+		},
+	}
+	out := plain(renderThreadMessage(msg, 60, nil, false))
+	if !strings.Contains(out, "😂 Shashwat") {
+		t.Fatalf("single reaction should show the reactor's name:\n%s", out)
+	}
+
+	msg.Reactions = []domain.Reaction{
+		{Emoji: "😂", SenderName: "A"}, {Emoji: "😂", SenderName: "B"},
+		{Emoji: "😂", SenderName: "C"}, {Emoji: "👍", SenderName: "D"},
+	}
+	out = plain(renderThreadMessage(msg, 60, nil, false))
+	if !strings.Contains(out, "😂 3") || !strings.Contains(out, "👍 1") {
+		t.Fatalf("many reactions should aggregate to counts:\n%s", out)
+	}
+}
+
+func TestReactModeSendsQuickReaction(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 5)
+	m.threadMessageLimit = messageLimit
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := updated.(Model)
+	if !model.reacting || model.reactIndex != 4 {
+		t.Fatalf("reacting = %v, reactIndex = %d; want react mode on newest message", model.reacting, model.reactIndex)
+	}
+
+	// Move the cursor up one message, then send 😂 (slot 3).
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.reactIndex != 3 {
+		t.Fatalf("reactIndex = %d, want 3 after k", model.reactIndex)
+	}
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	model = updated.(Model)
+	if model.reacting {
+		t.Fatal("react mode should exit after sending")
+	}
+	if cmd == nil {
+		t.Fatal("expected reaction command")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("reaction result = %#v", result)
+	}
+	if transport.reactionTargetID != "thread-004" || transport.reactionEmoji != "😂" {
+		t.Fatalf("reaction sent = %q on %q, want 😂 on thread-004", transport.reactionEmoji, transport.reactionTargetID)
+	}
+
+	// x removes: empty emoji.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = updated.(Model)
+	_, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if cmd == nil {
+		t.Fatal("expected removal command")
+	}
+	if _ = cmd(); transport.reactionEmoji != "" {
+		t.Fatalf("removal emoji = %q, want empty", transport.reactionEmoji)
+	}
+}
+
+func TestComposerReplacesEmojiShortcodes(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.composer.Focus()
+	m.composer.SetValue("nice one :joy")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{':'}})
+	model := updated.(Model)
+	if got := model.composer.Value(); got != "nice one 😂" {
+		t.Fatalf("composer value = %q, want shortcode replaced", got)
+	}
+}
+
+func TestEmojiSuggestionsForTrailingShortcode(t *testing.T) {
+	t.Parallel()
+
+	suggestions := emojiSuggestions("brb :fi", 5)
+	if len(suggestions) == 0 {
+		t.Fatal("expected emoji suggestions for :fi prefix")
+	}
+	if !strings.Contains(suggestions[0].label, "🔥") {
+		t.Fatalf("first suggestion = %q, want fire emoji", suggestions[0].label)
+	}
+	if suggestions[0].replacement != "brb 🔥" {
+		t.Fatalf("replacement = %q, want token swapped for emoji", suggestions[0].replacement)
+	}
+	if emojiSuggestions("no token here", 5) != nil {
+		t.Fatal("expected no suggestions without a trailing :prefix")
 	}
 }

@@ -75,6 +75,21 @@ type Message struct {
 	MediaFileSHA256    []byte
 	MediaFileEncSHA256 []byte
 	DownloadedPath     string
+	Reactions          []Reaction
+}
+
+// Reaction is one sender's current emoji reaction on a message. Reactions
+// are last-write-wins state keyed by (chat, target message, sender); an
+// empty emoji means the sender removed their reaction.
+type Reaction struct {
+	ChatJID    string
+	TargetID   string
+	SenderJID  string
+	SenderName string
+	Emoji      string
+	// SenderTS is the sender's millisecond timestamp, used to reject
+	// out-of-order updates (e.g. a stale reaction arriving after its removal).
+	SenderTS int64
 }
 
 type Event struct {
@@ -102,6 +117,9 @@ type Transport interface {
 	SendImage(context.Context, string, string, string) error
 	SendMedia(context.Context, string, string, string) error
 	SendVoiceNote(context.Context, string, string, time.Duration) error
+	// SendReaction reacts to the message identified by (chatJID,
+	// targetSenderJID, targetMessageID); an empty emoji removes the reaction.
+	SendReaction(ctx context.Context, chatJID, targetSenderJID, targetMessageID, emoji string) error
 
 	DownloadMedia(context.Context, Message, string) (string, error)
 	RequestHistory(context.Context, string, int) error

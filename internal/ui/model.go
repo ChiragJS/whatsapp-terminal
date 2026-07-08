@@ -58,6 +58,10 @@ func spinnerTickCmd() tea.Cmd {
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// quickReactions is the 1-6 palette in react mode, mirroring WhatsApp's
+// default reaction row.
+var quickReactions = []string{"👍", "❤️", "😂", "😮", "😢", "🙏"}
+
 type chatsLoadedMsg struct {
 	chats []domain.ChatSummary
 	// mentions maps "@123…" tokens found in chat previews to contact names.
@@ -183,6 +187,9 @@ type Model struct {
 	threadMessageLimit   int
 	threadScroll         int
 	threadNewWhileAway   int
+	reacting             bool
+	reactIndex           int
+	suggestionsAreEmoji  bool
 	quitArmed            bool
 	quitAfterNavigation  bool
 	dataDir              string
@@ -628,6 +635,7 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = nil
 			m.mentionNames = nil
 			m.threadNewWhileAway = 0
+			m.reacting = false
 			m.threadHistoryPending = false
 			m.threadLoadingOlder = false
 			m.threadMessageLimit = messageLimit
@@ -648,6 +656,8 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateThreadMouse(msg)
 	case tea.KeyMsg:
 		switch {
+		case m.reacting:
+			return m.updateReactKey(msg)
 		case m.composing && m.filePickerOpen:
 			return m.updateFilePickerKey(msg)
 		case m.composing:
@@ -657,6 +667,58 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// updateReactKey drives react mode: j/k picks the target message, 1-6 sends
+// a quick reaction, x removes this device's reaction, esc cancels.
+func (m Model) updateReactKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key := msg.String(); key {
+	case "esc", "r":
+		m.reacting = false
+		return m, nil
+	case "k", "up":
+		m.reactIndex = clampSelection(m.reactIndex-1, len(m.messages))
+		m.alignScrollToReactCursor()
+		return m, nil
+	case "j", "down":
+		m.reactIndex = clampSelection(m.reactIndex+1, len(m.messages))
+		m.alignScrollToReactCursor()
+		return m, nil
+	case "1", "2", "3", "4", "5", "6":
+		target := m.messages[m.reactIndex]
+		m.reacting = false
+		return m, sendReactionCmd(m.transport, target, quickReactions[int(key[0]-'1')])
+	case "x":
+		target := m.messages[m.reactIndex]
+		m.reacting = false
+		return m, sendReactionCmd(m.transport, target, "")
+	}
+	return m, nil
+}
+
+// alignScrollToReactCursor keeps the react-mode cursor visible by scrolling
+// so the selected message sits at the bottom of the viewport.
+func (m *Model) alignScrollToReactCursor() {
+	layout := m.threadLayout()
+	width := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
+	below := 0
+	for i := len(m.messages) - 1; i > m.reactIndex; i-- {
+		below += countRenderedLines(renderThreadMessage(m.messages[i], width, m.mentionNames, false)) + 1
+	}
+	m.threadScroll = min(below, m.maxThreadScroll())
+}
+
+// sendReactionCmd sends (or with an empty emoji, removes) a reaction to the
+// given message.
+func sendReactionCmd(transport domain.Transport, target domain.Message, emoji string) tea.Cmd {
+	return func() tea.Msg {
+		err := transport.SendReaction(context.Background(), target.ChatJID, target.SenderJID, target.ID, emoji)
+		status := "Reaction sent"
+		if emoji == "" {
+			status = "Reaction removed"
+		}
+		return opResultMsg{err: err, status: status, chatJID: target.ChatJID, refresh: err == nil}
+	}
 }
 
 func (m Model) updateThreadMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -763,6 +825,12 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.composer, cmd = m.composer.Update(msg)
+	if msg.String() == ":" {
+		// Closing colon of a :shortcode: — swap known codes for emoji.
+		if value := m.composer.Value(); value != replaceEmojiShortcodes(value) {
+			m.composer.SetValue(replaceEmojiShortcodes(value))
+		}
+	}
 	m.refreshPathSuggestions()
 	if len(m.pathSuggestions) == 0 {
 		m.pathSuggestionFocus = false
@@ -807,6 +875,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.messages = nil
 		m.mentionNames = nil
 		m.threadNewWhileAway = 0
+		m.reacting = false
 		m.threadHistoryPending = false
 		m.threadLoadingOlder = false
 		m.threadMessageLimit = 0
@@ -850,6 +919,14 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, downloadMediaCmd(m.transport, *latest, m.downloadDir)
 	case "p":
 		return m.toggleVoicePlayback()
+	case "r":
+		if len(m.messages) == 0 {
+			return m, nil
+		}
+		m.reacting = true
+		m.reactIndex = len(m.messages) - 1
+		m.alignScrollToReactCursor()
+		return m, nil
 	}
 	return m, nil
 }
@@ -1109,7 +1186,7 @@ func (m Model) renderHelp() string {
 	left = append(left, section("Thread", [][2]string{
 		{"j/k", "scroll one line"}, {"pgup/pgdn", "scroll a page"}, {"home/end", "oldest · latest"},
 		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"},
-		{"p", "play · stop voice note"}, {"esc", "back to inbox"},
+		{"p", "play · stop voice note"}, {"r", "react to a message"}, {"esc", "back to inbox"},
 	})...)
 	var right []string
 	right = append(right, section("Compose", [][2]string{
@@ -1139,13 +1216,16 @@ func (m Model) renderHelp() string {
 }
 
 func (m Model) threadHelpText() string {
+	if m.reacting {
+		return "1 👍  2 ❤️  3 😂  4 😮  5 😢  6 🙏  x remove  j/k pick  esc cancel"
+	}
 	if m.composing {
 		if m.quitAfterNavigation {
 			return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste  esc·q quit"
 		}
 		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
 	}
-	return "esc back  j/k scroll  pgup/pgdn page  end latest  i compose  u history  d download  p play  ? help"
+	return "esc back  j/k scroll  i compose  r react  u history  d download  p play  ? help"
 }
 
 func (m Model) currentChat() *domain.ChatSummary {
@@ -2081,7 +2161,8 @@ func (m Model) threadMessageLines(width int) []string {
 			lines = append(lines, dateSeparator(day, now, width), "")
 			previousDay = day
 		}
-		lines = append(lines, strings.Split(renderThreadMessage(msg, width, m.mentionNames), "\n")...)
+		selected := m.reacting && i == m.reactIndex
+		lines = append(lines, strings.Split(renderThreadMessage(msg, width, m.mentionNames, selected), "\n")...)
 	}
 	return lines
 }
@@ -2296,6 +2377,11 @@ func (m *Model) clearPathSuggestions() {
 
 func (m *Model) refreshPathSuggestions() {
 	suggestions := filePathSuggestions(m.composer.Value(), maxPathSuggestions)
+	m.suggestionsAreEmoji = false
+	if len(suggestions) == 0 {
+		suggestions = emojiSuggestions(m.composer.Value(), maxPathSuggestions)
+		m.suggestionsAreEmoji = len(suggestions) > 0
+	}
 	m.pathSuggestions = suggestions
 	if len(m.pathSuggestions) == 0 {
 		m.pathSuggestionIdx = 0
@@ -2318,12 +2404,16 @@ func (m Model) renderPathSuggestions(width int) string {
 	if len(m.pathSuggestions) == 0 {
 		return ""
 	}
+	kind := "Paths"
+	if m.suggestionsAreEmoji {
+		kind = "Emoji"
+	}
 	var heading string
 	switch {
 	case m.pathSuggestionFocus:
-		heading = "Paths · j/k move · enter/tab apply · esc return"
+		heading = kind + " · j/k move · enter/tab apply · esc return"
 	default:
-		heading = "Paths · tab focus list · keep typing to refine"
+		heading = kind + " · tab focus list · keep typing to refine"
 	}
 	lines := []string{smallCap(heading, width)}
 	for idx, suggestion := range m.pathSuggestions {

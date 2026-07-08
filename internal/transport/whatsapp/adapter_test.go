@@ -13,6 +13,10 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 	waevents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
+
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 )
 
 func TestResolveChatTitleDoesNotReturnUnknownGroupJID(t *testing.T) {
@@ -225,5 +229,74 @@ func TestHandleReceiptResolvesLIDChatAlias(t *testing.T) {
 	}
 	if len(messages) != 1 || messages[0].Receipt != domain.ReceiptStateRead {
 		t.Fatalf("messages = %#v, want receipt marked read via LID alias", messages)
+	}
+}
+
+func TestHandleMessageRecordsReactionWithoutMessageRow(t *testing.T) {
+	t.Parallel()
+
+	repo, err := appstore.New(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+
+	if err := repo.RecordMessage(ctx, domain.Message{
+		ID: "target-1", ChatJID: "1203634@g.us", SenderJID: "bob@s.whatsapp.net", Text: "sticker",
+		Timestamp: time.Date(2026, 7, 8, 14, 42, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived, IsGroup: true,
+	}, false); err != nil {
+		t.Fatalf("RecordMessage() error = %v", err)
+	}
+
+	adapter := &Adapter{repo: repo, events: make(chan domain.Event, 8)}
+	evt := &waevents.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    types.NewJID("1203634", types.GroupServer),
+				Sender:  types.NewJID("911234", types.DefaultUserServer),
+				IsGroup: true,
+			},
+			ID:        "reaction-1",
+			Timestamp: time.Date(2026, 7, 8, 14, 43, 0, 0, time.UTC),
+		},
+		Message: &waE2E.Message{
+			ReactionMessage: &waE2E.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String("1203634@g.us"),
+					ID:        proto.String("target-1"),
+				},
+				Text:              proto.String("😂"),
+				SenderTimestampMS: proto.Int64(1700000000000),
+			},
+		},
+	}
+	if err := adapter.handleMessage(ctx, evt); err != nil {
+		t.Fatalf("handleMessage() error = %v", err)
+	}
+
+	messages, err := repo.ListMessages(ctx, "1203634@g.us", 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d rows, want 1 (reaction must not create a message row)", len(messages))
+	}
+	if len(messages[0].Reactions) != 1 || messages[0].Reactions[0].Emoji != "😂" {
+		t.Fatalf("reactions = %#v, want 😂 attached to target-1", messages[0].Reactions)
+	}
+
+	// Removal: same sender, empty text, later timestamp.
+	evt.Message.ReactionMessage.Text = proto.String("")
+	evt.Message.ReactionMessage.SenderTimestampMS = proto.Int64(1700000001000)
+	if err := adapter.handleMessage(ctx, evt); err != nil {
+		t.Fatalf("handleMessage(removal) error = %v", err)
+	}
+	messages, err = repo.ListMessages(ctx, "1203634@g.us", 10)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages[0].Reactions) != 0 {
+		t.Fatalf("reactions = %#v, want removal to clear the reaction", messages[0].Reactions)
 	}
 }

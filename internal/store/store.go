@@ -148,6 +148,15 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat_jid, id)
 );
 
+CREATE TABLE IF NOT EXISTS reactions (
+    chat_jid TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    sender_jid TEXT NOT NULL,
+    emoji TEXT NOT NULL DEFAULT '',
+    sender_ts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_jid, target_id, sender_jid)
+);
+
 CREATE INDEX IF NOT EXISTS idx_contacts_normalized_name ON contacts(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_chats_normalized_title ON chats(normalized_title);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
@@ -175,7 +184,79 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
 			return err
 		}
 	}
+	if err := s.purgeReactionPlaceholderMessages(ctx); err != nil {
+		return err
+	}
 	return s.clearJIDTitles(ctx)
+}
+
+// purgeReactionPlaceholderMessages deletes message rows an older version
+// created for incoming reactions ("[reaction]" with no emoji or target).
+// Reactions now live in the reactions table; a history re-sync repopulates
+// them there. Idempotent.
+func (s *Store) purgeReactionPlaceholderMessages(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `
+DELETE FROM messages WHERE text_body = '[reaction]' AND media_kind = ''
+`); err != nil {
+		return fmt.Errorf("purge reaction placeholder messages: %w", err)
+	}
+	return nil
+}
+
+// UpsertReaction applies one reaction state change with last-write-wins
+// semantics. Removals (empty emoji) are stored as tombstone rows rather
+// than deleted, so a stale reaction delivered after its removal cannot
+// resurrect it: the sender_ts guard rejects anything older than what is
+// already stored.
+func (s *Store) UpsertReaction(ctx context.Context, reaction domain.Reaction) error {
+	if ignoredChatJID(reaction.ChatJID) {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO reactions (chat_jid, target_id, sender_jid, emoji, sender_ts)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(chat_jid, target_id, sender_jid) DO UPDATE SET
+    emoji = excluded.emoji,
+    sender_ts = excluded.sender_ts
+WHERE excluded.sender_ts >= reactions.sender_ts
+`, reaction.ChatJID, reaction.TargetID, reaction.SenderJID, reaction.Emoji, reaction.SenderTS)
+	if err != nil {
+		return fmt.Errorf("upsert reaction %s/%s: %w", reaction.ChatJID, reaction.TargetID, err)
+	}
+	return nil
+}
+
+// listReactions returns the active (non-tombstone) reactions for a chat,
+// keyed by target message ID, with sender names resolved like messages.
+func (s *Store) listReactions(ctx context.Context, chatJID string) (map[string][]domain.Reaction, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT r.target_id, r.sender_jid,
+       CASE
+           WHEN contacts.display_name <> '' THEN contacts.display_name
+           WHEN contacts.push_name <> '' THEN contacts.push_name
+           WHEN contacts.business_name <> '' THEN contacts.business_name
+           ELSE r.sender_jid
+       END AS sender_name,
+       r.emoji
+FROM reactions r
+LEFT JOIN contacts ON contacts.jid = r.sender_jid
+WHERE r.chat_jid = ? AND r.emoji <> ''
+ORDER BY r.sender_ts ASC
+`, chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("list reactions %s: %w", chatJID, err)
+	}
+	defer rows.Close()
+
+	reactions := make(map[string][]domain.Reaction)
+	for rows.Next() {
+		reaction := domain.Reaction{ChatJID: chatJID}
+		if err := rows.Scan(&reaction.TargetID, &reaction.SenderJID, &reaction.SenderName, &reaction.Emoji); err != nil {
+			return nil, fmt.Errorf("scan reaction: %w", err)
+		}
+		reactions[reaction.TargetID] = append(reactions[reaction.TargetID], reaction)
+	}
+	return reactions, rows.Err()
 }
 
 // clearJIDTitles scrubs chat rows whose title was poisoned with the raw JID
@@ -747,7 +828,18 @@ ORDER BY ts ASC, message_rowid ASC
 		}
 		messages = append(messages, msg)
 	}
-	return messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	reactions, err := s.listReactions(ctx, chatJID)
+	if err != nil {
+		return nil, err
+	}
+	for idx := range messages {
+		messages[idx].Reactions = reactions[messages[idx].ID]
+	}
+	return messages, nil
 }
 
 func (s *Store) OldestMessage(ctx context.Context, chatJID string) (*domain.Message, error) {

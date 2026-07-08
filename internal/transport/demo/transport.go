@@ -98,6 +98,24 @@ func (t *Transport) SendVoiceNote(ctx context.Context, chatJID, path string, dur
 	return t.recordOutgoingMedia(ctx, chatJID, path, "", domain.MediaKindVoice, domain.MediaKindAudio, duration)
 }
 
+func (t *Transport) SendReaction(ctx context.Context, chatJID, targetSenderJID, targetMessageID, emoji string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if err := t.repo.UpsertReaction(ctx, domain.Reaction{
+		ChatJID:   chatJID,
+		TargetID:  targetMessageID,
+		SenderJID: "self@s.whatsapp.net",
+		Emoji:     emoji,
+		SenderTS:  time.Now().UnixMilli(),
+	}); err != nil {
+		return err
+	}
+	t.emit(domain.Event{Type: domain.EventChatUpdate, ChatJID: chatJID})
+	t.emit(domain.Event{Type: domain.EventStatus, Status: "Reaction sent in demo mode"})
+	return nil
+}
+
 func (t *Transport) DownloadMedia(ctx context.Context, msg domain.Message, downloadDir string) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
