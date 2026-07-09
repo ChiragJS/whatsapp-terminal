@@ -246,7 +246,11 @@ func NewModel(repo *appstore.Store, transport domain.Transport) Model {
 
 	composer := textarea.New()
 	composer.Placeholder = "type a message…"
-	composer.Prompt = "› "
+	// No prompt glyph: bubbles repeats the prompt on every wrapped visual
+	// row (not just the first logical line), which reads as a column of
+	// stray arrows down a wrapped paragraph. The bordered panel and toolbar
+	// above it already mark this as the input box.
+	composer.Prompt = ""
 	composer.CharLimit = 4096
 	composer.ShowLineNumbers = false
 	composer.SetHeight(1)
@@ -2634,8 +2638,28 @@ func (m *Model) resizeComposer(width, maxHeight int) {
 		return
 	}
 	m.composer.SetWidth(max(12, width))
-	inputWidth := max(8, width-len([]rune(m.composer.Prompt)))
-	targetHeight := clampComposerHeight(composerHeightForDraft(m.composer.Value(), inputWidth), maxHeight)
+	// Query bubbles' own post-reservation width rather than recomputing it
+	// (subtracting prompt/border/padding ourselves): any drift between that
+	// guess and what the textarea actually wraps at means we estimate too
+	// few rows, so the cursor ends up on a real visual row beyond the
+	// Height we allotted it — content past that point renders as if lost.
+	//
+	// The "+1" is a deliberate, unconditional margin — not slack for its
+	// own sake. Verified empirically (isolated repro, not just theory):
+	// when Height is set to exactly the number of rows a wrapped line
+	// needs, bubbles' textarea can drop a middle row from the render —
+	// content that was typed is simply missing from the screen, though it
+	// is not lost from the draft itself. Every conditional attempt to skip
+	// this margin for the "obviously fine" cases (checking bubbles'
+	// LineInfo, or our own width math, to add it only once a line actually
+	// wraps) reintroduced the bug despite converging on the identical final
+	// height and content — the height trajectory across earlier keystrokes
+	// matters, not just the final value, because the textarea's scroll
+	// offset is state that accumulates incrementally. Keeping the margin
+	// unconditional means an empty draft costs one extra blank row; that is
+	// a strictly better trade than silently dropped content.
+	needed := composerHeightForDraft(m.composer.Value(), m.composer.Width()) + 1
+	targetHeight := clampComposerHeight(needed, maxHeight)
 	m.composer.SetHeight(targetHeight)
 	// SetHeight only changes the viewport's height field; it does not
 	// rescroll. The scroll-position fix comes from the textarea's own
@@ -2655,7 +2679,22 @@ func (m Model) composerGeometry() (width, maxHeight int) {
 	header := m.renderHeader(m.threadTitle(), "")
 	footer := m.renderFooter(m.threadHelpText())
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
-	return contentWidth - boxMutedStyle.GetHorizontalFrameSize(), max(3, bodyHeight/3)
+	// Let the composer grow well past a third of the body height — a merely
+	// long message shouldn't force internal scrolling this early, hiding
+	// lines the user just typed — but the reserved margin must genuinely
+	// cover everything else sharing bodyHeight: the messages panel's own
+	// floor (threadLayout's messageHeight, clamped to 8) plus the composer
+	// panel's own non-textarea overhead (the one-line toolbar and its
+	// border). Skimping on this budget doesn't just squeeze the messages
+	// panel — threadLayout has no further clamp once its own floor is hit,
+	// so the combined frame can exceed m.height and fitFrame's crude
+	// bottom-truncation silently chops off the composer's newest rows.
+	const (
+		reservedForMessagesFloor  = 8
+		reservedForComposerChrome = 1 + 2 // toolbar row + boxMutedStyle border
+	)
+	return contentWidth - boxMutedStyle.GetHorizontalFrameSize(),
+		max(3, bodyHeight-reservedForMessagesFloor-reservedForComposerChrome)
 }
 
 // syncComposerSize resizes the composer to fit its current content and

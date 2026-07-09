@@ -1375,15 +1375,19 @@ func TestThreadComposeExpandsForMultilineDraft(t *testing.T) {
 	if !strings.Contains(view, "hello") || !strings.Contains(view, "my name is Chirag") || !strings.Contains(view, "- hello") {
 		t.Fatalf("thread view missing multiline draft:\n%s", view)
 	}
-	if got := m.composer.Height(); got != 3 {
-		t.Fatalf("composer height = %d, want exactly 3 rows for a 3-line draft", got)
+	// +1: resizeComposer keeps one row of headroom beyond the minimum
+	// needed — a verified-necessary margin against a bubbles textarea
+	// rendering edge case, not a bug here (see resizeComposer's comment).
+	if got := m.composer.Height(); got != 4 {
+		t.Fatalf("composer height = %d, want 4 (3-line draft + one spare row)", got)
 	}
 
-	// An empty draft needs a single row: one prompt arrow, not three.
+	// An empty draft still costs far less than the old fixed-3-rows
+	// behavior: one real row plus the spare-row margin, not three.
 	m.composer.SetValue("")
 	m.resizeComposer(80, 8)
-	if got := m.composer.Height(); got != 1 {
-		t.Fatalf("composer height = %d, want 1 for empty draft", got)
+	if got := m.composer.Height(); got != 2 {
+		t.Fatalf("composer height = %d, want 2 (empty draft + one spare row)", got)
 	}
 }
 
@@ -2723,7 +2727,12 @@ func TestComposerLongDraftStaysScrolledToCursorNotStuckBlank(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	model := updated.(Model)
 
-	const lineCount = 10
+	// The composer is allowed to grow generously (composerGeometry's
+	// maxHeight) before it must resort to internal scrolling — derive the
+	// line count from that cap instead of a fixed number, so this test keeps
+	// exercising genuine overflow regardless of how tall the cap is tuned.
+	_, maxHeightBudget := model.composerGeometry()
+	lineCount := maxHeightBudget + 10
 	for i := 0; i < lineCount; i++ {
 		if i > 0 {
 			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
@@ -2762,6 +2771,51 @@ func TestComposerLongDraftStaysScrolledToCursorNotStuckBlank(t *testing.T) {
 		want := fmt.Sprintf("L%d", i)
 		if !strings.Contains(body, want) {
 			t.Fatalf("composer body missing %q, expected the trailing window to hold the last %d lines:\n%s", want, maxHeight, body)
+		}
+	}
+}
+
+// TestComposerModerateDraftNeverHidesContent pins the product decision behind
+// the height-cap change: a merely long draft (well under the generous cap)
+// must never trigger internal scrolling that hides lines the user just
+// typed. Only pathological drafts that exceed the cap should scroll at all.
+func TestComposerModerateDraftNeverHidesContent(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 30
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model := updated.(Model)
+
+	const lineCount = 10
+	for i := 0; i < lineCount; i++ {
+		if i > 0 {
+			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+			model = updated.(Model)
+		}
+		for _, r := range fmt.Sprintf("L%d", i) {
+			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			model = updated.(Model)
+		}
+	}
+
+	width, _ := model.composerGeometry()
+	// lineCount+1: resizeComposer always keeps one spare row of headroom
+	// (see its comment) — well under the cap, so still "did not clip".
+	if got := model.composer.Height(); got != lineCount+1 {
+		t.Fatalf("composer height = %d, want %d (content + one spare row) — a %d-line draft must fit without capping", got, lineCount+1, lineCount)
+	}
+	body := ansiPattern.ReplaceAllString(model.composerBody(width), "")
+	for i := 0; i < lineCount; i++ {
+		want := fmt.Sprintf("L%d", i)
+		if !strings.Contains(body, want) {
+			t.Fatalf("composer body missing %q — a moderate draft must show every line, none hidden by scrolling:\n%s", want, body)
 		}
 	}
 }
