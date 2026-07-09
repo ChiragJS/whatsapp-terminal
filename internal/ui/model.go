@@ -603,6 +603,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.clearComposer {
 				m.composer.SetValue("")
 				m.draftMentions = nil
+				m.syncComposerSize()
 			}
 			if msg.clearAttachments {
 				m.clearPendingAttachments()
@@ -640,6 +641,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.pendingAttachments = append(m.pendingAttachments, msg.attachment)
 		m.composer.SetValue(appendDraftToken(m.composer.Value(), msg.attachment.token))
+		m.syncComposerSize()
 		if msg.status != "" {
 			m.status = msg.status
 		}
@@ -1022,6 +1024,7 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// the textarea is blurred — instead of reading as the attach
 		// toolbar button.
 		m.composer.InsertRune('+')
+		m.syncComposerSize()
 		m.refreshPathSuggestions()
 		return m, nil
 	case "ctrl+n":
@@ -1062,6 +1065,7 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// shift+enter, indistinguishable from enter, so "shift+enter" only
 			// fires in the rare setups that report it distinctly.
 			m.composer.InsertString("\n")
+			m.syncComposerSize()
 			m.refreshPathSuggestions()
 			return m, nil
 		case ActionComposeSend:
@@ -1078,6 +1082,7 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.composer.SetValue(replaceTrailingEmojiShortcode(value))
 		}
 	}
+	m.syncComposerSize()
 	m.refreshPathSuggestions()
 	if len(m.pathSuggestions) == 0 {
 		m.pathSuggestionFocus = false
@@ -1138,8 +1143,13 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch action {
 	case ActionThreadCompose:
 		m.composing = true
+		focusCmd := m.composer.Focus()
+		// A draft can persist across an esc-cancel; resync now that focus is
+		// established (and geometry may have changed) so a leftover
+		// multi-line draft isn't stuck at a stale scroll position.
+		m.syncComposerSize()
 		m.refreshPathSuggestions()
-		return m, m.composer.Focus()
+		return m, focusCmd
 	case ActionThreadScrollUp:
 		return m.scrollThread(1)
 	case ActionThreadScrollDown:
@@ -1421,9 +1431,7 @@ func (m Model) renderThread() string {
 	header := m.renderHeader(m.threadTitle(), subtitle)
 	footer := m.renderFooter(m.threadHelpText())
 	if m.composing {
-		contentWidth := max(48, m.width-2)
-		bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
-		m.resizeComposer(contentWidth-boxMutedStyle.GetHorizontalFrameSize(), max(3, bodyHeight/3))
+		m.syncComposerSize()
 	}
 	layout := m.threadLayout()
 	viewport := paddedContentHeight(layout.messageHeight)
@@ -2629,6 +2637,39 @@ func (m *Model) resizeComposer(width, maxHeight int) {
 	inputWidth := max(8, width-len([]rune(m.composer.Prompt)))
 	targetHeight := clampComposerHeight(composerHeightForDraft(m.composer.Value(), inputWidth), maxHeight)
 	m.composer.SetHeight(targetHeight)
+	// SetHeight only changes the viewport's height field; it does not
+	// rescroll. The scroll-position fix comes from the textarea's own
+	// View(), which feeds the rendered content back into its viewport via
+	// SetContent — and SetContent clamps an out-of-bounds scroll offset back
+	// onto the content. Calling View() here for that side effect, and
+	// discarding its result, is the only way to force that correction
+	// through bubbles' public API: there is no exported "reposition" call.
+	_ = m.composer.View()
+}
+
+// composerGeometry returns the width and max-height budget the composer
+// should fit within for the current thread layout. Shared by the render
+// path and syncComposerSize so both agree on the same numbers.
+func (m Model) composerGeometry() (width, maxHeight int) {
+	contentWidth := max(48, m.width-2)
+	header := m.renderHeader(m.threadTitle(), "")
+	footer := m.renderFooter(m.threadHelpText())
+	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
+	return contentWidth - boxMutedStyle.GetHorizontalFrameSize(), max(3, bodyHeight/3)
+}
+
+// syncComposerSize resizes the composer to fit its current content and
+// corrects its scroll position (see resizeComposer). Call this after every
+// real change to composer content — typing, newline/emoji/mention
+// insertion, attachment tokens, clearing on send — not just at render time.
+// bubbles' textarea only scrolls to follow the cursor inside its own
+// Update(), using whatever Height was already set at that moment, so a
+// stale Height there produces a tightly-scrolled view that clips everything
+// above the cursor. Calling this eagerly keeps Height correct going into the
+// next real keystroke, on top of the render path's own call.
+func (m *Model) syncComposerSize() {
+	width, maxHeight := m.composerGeometry()
+	m.resizeComposer(width, maxHeight)
 }
 
 func (m *Model) nextImagePlaceholder() string {
@@ -2818,6 +2859,7 @@ func (m *Model) applySelectedPathSuggestion() bool {
 	}
 	suggestion := m.pathSuggestions[m.pathSuggestionIdx]
 	m.composer.SetValue(suggestion.replacement)
+	m.syncComposerSize()
 	if suggestion.mentionJID != "" {
 		if m.draftMentions == nil {
 			m.draftMentions = make(map[string]string)

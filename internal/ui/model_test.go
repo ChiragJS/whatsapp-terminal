@@ -2698,3 +2698,70 @@ func TestErrorBannerRestartsTTLOnNewError(t *testing.T) {
 		t.Fatalf("lastErr = %q, want the new error's TTL to have restarted", model.lastErr)
 	}
 }
+
+// TestComposerLongDraftStaysScrolledToCursorNotStuckBlank reproduces a
+// reported bug: once a draft grew past the composer's capped height, older
+// lines appeared to vanish and the box showed mostly blank space instead of
+// scrolling to keep following the cursor. Root cause: resizeComposer used to
+// run only from the View path (a value receiver, so its mutations never
+// persisted), so the real composer stayed stuck at its construction height
+// and bubbles' own cursor-follow scrolling ran against that stale, tiny
+// height on every real keystroke. This drives real Update() calls end to
+// end — never calling resizeComposer directly — to prove the real, persisted
+// composer resizes and stays properly scrolled.
+func TestComposerLongDraftStaysScrolledToCursorNotStuckBlank(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 30
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model := updated.(Model)
+
+	const lineCount = 10
+	for i := 0; i < lineCount; i++ {
+		if i > 0 {
+			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+			model = updated.(Model)
+		}
+		for _, r := range fmt.Sprintf("L%d", i) {
+			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			model = updated.(Model)
+		}
+	}
+
+	width, maxHeight := model.composerGeometry()
+	if got := model.composer.Height(); got != maxHeight {
+		t.Fatalf("composer height = %d, want capped at %d (real Model, not stuck at construction height)", got, maxHeight)
+	}
+
+	body := ansiPattern.ReplaceAllString(model.composerBody(width), "")
+	lines := strings.Split(body, "\n")
+	blank := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			blank++
+		}
+	}
+	if blank > 1 { // the toolbar row above the textarea legitimately renders blank-ish
+		t.Fatalf("composer body has %d blank lines while %d-line draft overflows a %d-row box, want it packed with content:\n%s",
+			blank, lineCount, maxHeight, body)
+	}
+	if !strings.Contains(body, fmt.Sprintf("L%d", lineCount-1)) {
+		t.Fatalf("composer body missing the most recently typed line:\n%s", body)
+	}
+
+	// The window must be a real contiguous slice of the draft — the last
+	// maxHeight lines typed — not a stale one-line view padded with blanks.
+	for i := lineCount - maxHeight; i < lineCount; i++ {
+		want := fmt.Sprintf("L%d", i)
+		if !strings.Contains(body, want) {
+			t.Fatalf("composer body missing %q, expected the trailing window to hold the last %d lines:\n%s", want, maxHeight, body)
+		}
+	}
+}
