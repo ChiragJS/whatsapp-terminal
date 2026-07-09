@@ -192,8 +192,10 @@ type Model struct {
 	threadMessageLimit   int
 	threadScroll         int
 	threadNewWhileAway   int
-	reacting             bool
-	reactIndex           int
+	selecting            bool
+	selectIndex          int
+	mediaPickerOpen      bool
+	mediaPickerIndex     int
 	suggestionsKind      string
 	draftMentions        map[string]string
 	quitArmed            bool
@@ -428,13 +430,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.threadMessageLimit == 0 {
 				m.threadMessageLimit = messageLimit
 			}
-			reactTargetID := ""
-			if m.reacting && m.reactIndex >= 0 && m.reactIndex < len(m.messages) {
-				reactTargetID = m.messages[m.reactIndex].ID
+			selectTargetID := ""
+			if m.selecting && m.selectIndex >= 0 && m.selectIndex < len(m.messages) {
+				selectTargetID = m.messages[m.selectIndex].ID
 			}
 			m.messages = msg.messages
 			m.mentionNames = msg.mentions
-			m.reanchorReactCursor(reactTargetID)
+			m.reanchorSelectCursor(selectTargetID)
 			// Count messages appended after the previous newest by walking
 			// back to its ID. A capped reload drops rows from the top, so
 			// slice-length deltas undercount arrivals.
@@ -667,7 +669,8 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = nil
 			m.mentionNames = nil
 			m.threadNewWhileAway = 0
-			m.reacting = false
+			m.selecting = false
+			m.mediaPickerOpen = false
 			m.threadHistoryPending = false
 			m.threadLoadingOlder = false
 			m.threadMessageLimit = messageLimit
@@ -688,8 +691,10 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateThreadMouse(msg)
 	case tea.KeyMsg:
 		switch {
-		case m.reacting:
-			return m.updateReactKey(msg)
+		case m.mediaPickerOpen:
+			return m.updateMediaPickerKey(msg)
+		case m.selecting:
+			return m.updateSelectKey(msg)
 		case m.composing && m.filePickerOpen:
 			return m.updateFilePickerKey(msg)
 		case m.composing:
@@ -701,28 +706,40 @@ func (m Model) updateThread(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// updateReactKey drives react mode: j/k picks the target message, 1-6 sends
-// a quick reaction, x removes this device's reaction, esc cancels.
-func (m Model) updateReactKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// updateSelectKey drives select mode: j/k picks the target message, 1-6
+// sends a quick reaction, x removes this device's reaction, d saves the
+// selected message's media, p plays it, esc cancels. Reactions exit the mode;
+// media actions stay in it so several can chain.
+func (m Model) updateSelectKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key := msg.String(); key {
 	case "esc", "r":
-		m.reacting = false
+		m.selecting = false
 		return m, nil
 	case "k", "up":
-		m.reactIndex = clampSelection(m.reactIndex-1, len(m.messages))
-		m.alignScrollToReactCursor()
+		m.selectIndex = clampSelection(m.selectIndex-1, len(m.messages))
+		m.alignScrollToSelectCursor()
 		return m, nil
 	case "j", "down":
-		m.reactIndex = clampSelection(m.reactIndex+1, len(m.messages))
-		m.alignScrollToReactCursor()
+		m.selectIndex = clampSelection(m.selectIndex+1, len(m.messages))
+		m.alignScrollToSelectCursor()
 		return m, nil
-	case "1", "2", "3", "4", "5", "6", "x":
-		if m.reactIndex < 0 || m.reactIndex >= len(m.messages) {
-			m.reacting = false
+	case "d":
+		if m.selectIndex < 0 || m.selectIndex >= len(m.messages) {
 			return m, nil
 		}
-		target := m.messages[m.reactIndex]
-		m.reacting = false
+		return m.downloadSelectedMessage(m.messages[m.selectIndex])
+	case "p":
+		if m.selectIndex < 0 || m.selectIndex >= len(m.messages) {
+			return m, nil
+		}
+		return m.playSelectedMessage(m.messages[m.selectIndex])
+	case "1", "2", "3", "4", "5", "6", "x":
+		if m.selectIndex < 0 || m.selectIndex >= len(m.messages) {
+			m.selecting = false
+			return m, nil
+		}
+		target := m.messages[m.selectIndex]
+		m.selecting = false
 		emoji := ""
 		if key != "x" {
 			emoji = quickReactions[int(key[0]-'1')]
@@ -732,39 +749,73 @@ func (m Model) updateReactKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// alignScrollToReactCursor keeps the react-mode cursor visible by scrolling
+// downloadSelectedMessage saves the given message's media, staying in the
+// current mode so more items can be actioned. No media, an already-saved
+// file, or a no-longer-downloadable message each report a status without
+// issuing a download.
+func (m Model) downloadSelectedMessage(target domain.Message) (tea.Model, tea.Cmd) {
+	switch {
+	case target.MediaKind == domain.MediaKindNone:
+		m.lastErr = "selected message has no media"
+		return m, nil
+	case target.DownloadedPath != "":
+		m.status = "Already saved · " + filepath.Base(target.DownloadedPath)
+		return m, nil
+	case target.MediaDirectPath != "":
+		return m, downloadMediaCmd(m.transport, target, m.downloadDir)
+	default:
+		m.lastErr = "media is no longer downloadable"
+		return m, nil
+	}
+}
+
+// playSelectedMessage plays the given message when it is a voice note or
+// audio clip, downloading it first when needed. Stays in the current mode.
+func (m Model) playSelectedMessage(target domain.Message) (tea.Model, tea.Cmd) {
+	if m.player == nil {
+		return m, nil
+	}
+	if target.MediaKind != domain.MediaKindVoice && target.MediaKind != domain.MediaKindAudio {
+		m.lastErr = "selected message is not a voice note or audio"
+		return m, nil
+	}
+	m.status = "Starting playback..."
+	return m, playVoiceCmd(m.transport, m.player, target, m.downloadDir)
+}
+
+// alignScrollToSelectCursor keeps the select-mode cursor visible by scrolling
 // so the selected message sits at the bottom of the viewport. It derives the
 // offset from the real block layout, so date separators are accounted for.
-func (m *Model) alignScrollToReactCursor() {
-	if len(m.messages) == 0 || m.reactIndex < 0 || m.reactIndex >= len(m.messages) {
+func (m *Model) alignScrollToSelectCursor() {
+	if len(m.messages) == 0 || m.selectIndex < 0 || m.selectIndex >= len(m.messages) {
 		return
 	}
 	layout := m.threadLayout()
 	width := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
 	lines, ends := m.threadMessageBlocks(width)
-	below := len(lines) - ends[m.reactIndex]
+	below := len(lines) - ends[m.selectIndex]
 	maxScroll := max(0, len(lines)-paddedContentHeight(layout.messageHeight))
 	m.threadScroll = min(below, maxScroll)
 }
 
-// reanchorReactCursor re-points the react-mode cursor at the same message
+// reanchorSelectCursor re-points the select-mode cursor at the same message
 // after m.messages is replaced: a background reload can shift indexes or
-// drop the target entirely, and a stale index would react to the wrong
-// message. Exits react mode when the target is gone.
-func (m *Model) reanchorReactCursor(targetID string) {
-	if !m.reacting {
+// drop the target entirely, and a stale index would act on the wrong
+// message. Exits select mode when the target is gone.
+func (m *Model) reanchorSelectCursor(targetID string) {
+	if !m.selecting {
 		return
 	}
 	if targetID != "" {
 		for i, msg := range m.messages {
 			if msg.ID == targetID {
-				m.reactIndex = i
+				m.selectIndex = i
 				return
 			}
 		}
 	}
-	m.reacting = false
-	m.reactIndex = 0
+	m.selecting = false
+	m.selectIndex = 0
 }
 
 // sendReactionCmd sends (or with an empty emoji, removes) a reaction to the
@@ -937,7 +988,8 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.messages = nil
 		m.mentionNames = nil
 		m.threadNewWhileAway = 0
-		m.reacting = false
+		m.selecting = false
+		m.mediaPickerOpen = false
 		m.threadHistoryPending = false
 		m.threadLoadingOlder = false
 		m.threadMessageLimit = 0
@@ -985,10 +1037,59 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.messages) == 0 {
 			return m, nil
 		}
-		m.reacting = true
-		m.reactIndex = len(m.messages) - 1
-		m.alignScrollToReactCursor()
+		m.selecting = true
+		m.selectIndex = len(m.messages) - 1
+		m.alignScrollToSelectCursor()
 		return m, nil
+	case "m":
+		items := m.mediaMessages()
+		if len(items) == 0 {
+			m.lastErr = "no media in the loaded messages"
+			return m, nil
+		}
+		m.mediaPickerOpen = true
+		m.mediaPickerIndex = len(items) - 1
+		return m, nil
+	}
+	return m, nil
+}
+
+// mediaMessages returns every loaded message carrying media, in thread order.
+func (m Model) mediaMessages() []domain.Message {
+	var out []domain.Message
+	for _, msg := range m.messages {
+		if msg.MediaKind != domain.MediaKindNone {
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+// updateMediaPickerKey drives the media picker overlay: j/k move (wrapping),
+// enter/d download the selected item, p plays audio, esc/m close. The media
+// slice is re-derived on every keypress so a background reload cannot leave a
+// stale index behind.
+func (m Model) updateMediaPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	items := m.mediaMessages()
+	if len(items) == 0 {
+		m.mediaPickerOpen = false
+		return m, nil
+	}
+	m.mediaPickerIndex = clampSelection(m.mediaPickerIndex, len(items))
+	switch msg.String() {
+	case "esc", "m":
+		m.mediaPickerOpen = false
+		return m, nil
+	case "j", "down":
+		m.mediaPickerIndex = cycleSelection(m.mediaPickerIndex, 1, len(items))
+		return m, nil
+	case "k", "up":
+		m.mediaPickerIndex = cycleSelection(m.mediaPickerIndex, -1, len(items))
+		return m, nil
+	case "enter", "d":
+		return m.downloadSelectedMessage(items[m.mediaPickerIndex])
+	case "p":
+		return m.playSelectedMessage(items[m.mediaPickerIndex])
 	}
 	return m, nil
 }
@@ -1187,8 +1288,13 @@ func (m Model) renderThread() string {
 	layout := m.threadLayout()
 	viewport := paddedContentHeight(layout.messageHeight)
 	lineWidth := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
-	messages := renderPanel(boxStyle, layout.contentWidth, layout.messageHeight, m.threadBody(viewport, lineWidth))
-	messages = m.overlayScrollThumb(messages, viewport, lineWidth)
+	var messages string
+	if m.mediaPickerOpen {
+		messages = renderPanel(boxStyle, layout.contentWidth, layout.messageHeight, m.mediaPickerBody(viewport, lineWidth))
+	} else {
+		messages = renderPanel(boxStyle, layout.contentWidth, layout.messageHeight, m.threadBody(viewport, lineWidth))
+		messages = m.overlayScrollThumb(messages, viewport, lineWidth)
+	}
 	composer := renderPanel(boxMutedStyle, layout.contentWidth, layout.composerHeight, layout.composerContent)
 	return lipgloss.JoinVertical(lipgloss.Left, header, messages, composer, footer)
 }
@@ -1249,7 +1355,8 @@ func (m Model) renderHelp() string {
 	left = append(left, section("Thread", [][2]string{
 		{"j/k", "scroll one line"}, {"pgup/pgdn", "scroll a page"}, {"home/end", "oldest · latest"},
 		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"},
-		{"p", "play · stop voice note"}, {"r", "react to a message"}, {"esc", "back to inbox"},
+		{"p", "play · stop voice note"}, {"r", "select message (react · save · play)"}, {"m", "browse chat media"},
+		{"esc", "back to inbox"},
 	})...)
 	var right []string
 	right = append(right, section("Compose", [][2]string{
@@ -1280,8 +1387,11 @@ func (m Model) renderHelp() string {
 }
 
 func (m Model) threadHelpText() string {
-	if m.reacting {
-		return "1 👍  2 ❤️  3 😂  4 😮  5 😢  6 🙏  x remove  j/k pick  esc cancel"
+	if m.mediaPickerOpen {
+		return "enter·d save  p play  j/k move  esc close"
+	}
+	if m.selecting {
+		return "1-6 react  x unreact  d save  p play  j/k pick  esc done"
 	}
 	if m.composing {
 		if m.quitAfterNavigation {
@@ -1289,7 +1399,7 @@ func (m Model) threadHelpText() string {
 		}
 		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
 	}
-	return "esc back  j/k scroll  i compose  r react  u history  d download  p play  ? help"
+	return "esc back  j/k scroll  i compose  r select  m media  u history  d download  p play  ? help"
 }
 
 func (m Model) currentChat() *domain.ChatSummary {
@@ -2232,7 +2342,7 @@ func (m Model) threadMessageBlocks(width int) ([]string, []int) {
 			lines = append(lines, dateSeparator(day, now, width), "")
 			previousDay = day
 		}
-		selected := m.reacting && i == m.reactIndex
+		selected := m.selecting && i == m.selectIndex
 		lines = append(lines, strings.Split(renderThreadMessage(msg, width, m.mentionNames, selected), "\n")...)
 		ends[i] = len(lines)
 	}
@@ -2267,6 +2377,59 @@ func (m Model) threadBody(contentHeight, width int) string {
 	end := len(lines) - scroll
 	start := max(0, end-contentHeight)
 	return strings.Join(lines[start:end], "\n")
+}
+
+// mediaPickerBody renders the media picker overlay's content: a header and a
+// windowed list of media items, one row each, with the selection highlighted.
+// The window mirrors renderFilePicker: it keeps the selected row visible.
+func (m Model) mediaPickerBody(contentHeight, width int) string {
+	width = max(18, width)
+	items := m.mediaMessages()
+	lines := []string{smallCap(fmt.Sprintf("Media · %d items", len(items)), width)}
+	if len(items) == 0 {
+		lines = append(lines, subtleStyle.Render("  (no media)"))
+		return strings.Join(lines, "\n")
+	}
+	selected := clampSelection(m.mediaPickerIndex, len(items))
+	limit := max(1, contentHeight-2)
+	if limit > len(items) {
+		limit = len(items)
+	}
+	start := 0
+	if selected >= limit {
+		start = selected - limit + 1
+	}
+	end := min(len(items), start+limit)
+	for idx := start; idx < end; idx++ {
+		lines = append(lines, mediaPickerRow(items[idx], idx == selected, width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// mediaPickerRow renders one media picker entry: a selection rail, timestamp,
+// kind, optional filename, size, duration, and a saved marker.
+func mediaPickerRow(msg domain.Message, selected bool, width int) string {
+	rail := "  "
+	if selected {
+		rail = railStyle.Render("▌ ")
+	}
+	parts := []string{
+		timestampStyle.Render(msg.Timestamp.Local().Format("15:04 Jan 2")),
+		chipLabelStyle.Render(string(msg.MediaKind)),
+	}
+	if msg.MediaFileName != "" {
+		parts = append(parts, chipLabelStyle.Render(msg.MediaFileName))
+	}
+	if msg.MediaFileLength > 0 {
+		parts = append(parts, chipLabelStyle.Render(humanFileSize(msg.MediaFileLength)))
+	}
+	if msg.MediaSeconds > 0 {
+		parts = append(parts, chipLabelStyle.Render(fmt.Sprintf("%d:%02d", msg.MediaSeconds/60, msg.MediaSeconds%60)))
+	}
+	if msg.DownloadedPath != "" {
+		parts = append(parts, chipKeyStyle.Render("✓"))
+	}
+	return rail + truncateText(strings.Join(parts, " "), max(12, width-2))
 }
 
 func (m Model) composerBody(width int) string {

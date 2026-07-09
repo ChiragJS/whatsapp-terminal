@@ -2411,3 +2411,231 @@ func TestThreadScrollMovesOneLineAtATime(t *testing.T) {
 		}
 	}
 }
+
+func selectModeThreadModel(t *testing.T, transport *fakeTransport, messages []domain.Message) Model {
+	t.Helper()
+	repo := seededRepo(t)
+	m := NewModel(repo, transport).WithClipboard(&fakeClipboard{}).WithSounder(&fakeSounder{}).WithRecorder(&fakeVoiceRecorder{}).WithDownloadDir(t.TempDir())
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = messages
+	m.threadMessageLimit = messageLimit
+	return m
+}
+
+func TestSelectModeDownloadsSelectedMedia(t *testing.T) {
+	t.Parallel()
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	m := selectModeThreadModel(t, transport, []domain.Message{
+		{ID: "s1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "hi", Timestamp: base},
+		{ID: "s2", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "[image] board.png",
+			MediaKind: domain.MediaKindImage, MediaDirectPath: "/wa/media/s2", Timestamp: base.Add(time.Minute)},
+		{ID: "s3", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "bye", Timestamp: base.Add(2 * time.Minute)},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := updated.(Model)
+	// r lands on the newest (index 2); k moves onto the middle media message.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.selectIndex != 1 {
+		t.Fatalf("selectIndex = %d, want 1 (middle media message)", model.selectIndex)
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected download command")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("download result = %#v", result)
+	}
+	if transport.downloadedMessage != "s2" {
+		t.Fatalf("downloadedMessage = %q, want s2", transport.downloadedMessage)
+	}
+	if !model.selecting {
+		t.Fatal("expected to stay in select mode after downloading")
+	}
+}
+
+func TestSelectModeDownloadRejectsNonMedia(t *testing.T) {
+	t.Parallel()
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	m := selectModeThreadModel(t, transport, []domain.Message{
+		{ID: "t1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "just text", Timestamp: base},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("did not expect a download command for a text message")
+	}
+	if model.lastErr == "" {
+		t.Fatal("expected lastErr when downloading a message with no media")
+	}
+	if transport.downloadedMessage != "" {
+		t.Fatalf("downloadedMessage = %q, want none", transport.downloadedMessage)
+	}
+}
+
+func TestSelectModePlaysSelectedVoice(t *testing.T) {
+	t.Parallel()
+
+	player := &fakeAudioPlayer{}
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	repo := seededRepo(t)
+	m := NewModel(repo, transport).WithPlayer(player).WithDownloadDir(t.TempDir())
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = []domain.Message{
+		{ID: "voice-1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "[voice note]",
+			MediaKind: domain.MediaKindVoice, MediaDirectPath: "/wa/media/voice-1", Timestamp: base},
+		{ID: "text-1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "later", Timestamp: base.Add(time.Minute)},
+	}
+	m.threadMessageLimit = messageLimit
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := updated.(Model)
+	// r lands on the newest text message; k moves onto the older voice note.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.selectIndex != 0 {
+		t.Fatalf("selectIndex = %d, want 0 (voice note)", model.selectIndex)
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected playback command")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("playback result = %#v", result)
+	}
+	if transport.downloadedMessage != "voice-1" {
+		t.Fatalf("downloadedMessage = %q, want voice-1 downloaded first", transport.downloadedMessage)
+	}
+	if player.playedPath == "" {
+		t.Fatal("expected the selected voice note to be played")
+	}
+	if !model.selecting {
+		t.Fatal("expected to stay in select mode after playing")
+	}
+}
+
+func TestMediaPickerListsAndDownloads(t *testing.T) {
+	t.Parallel()
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	m := selectModeThreadModel(t, transport, []domain.Message{
+		{ID: "p1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "hi", Timestamp: base},
+		{ID: "p2", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "[image] one.png",
+			MediaKind: domain.MediaKindImage, MediaDirectPath: "/wa/media/p2", Timestamp: base.Add(time.Minute)},
+		{ID: "p3", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "note", Timestamp: base.Add(2 * time.Minute)},
+		{ID: "p4", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "[image] two.png",
+			MediaKind: domain.MediaKindImage, MediaDirectPath: "/wa/media/p4", Timestamp: base.Add(3 * time.Minute)},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model := updated.(Model)
+	if !model.mediaPickerOpen {
+		t.Fatal("expected media picker to open")
+	}
+	if model.mediaPickerIndex != 1 {
+		t.Fatalf("mediaPickerIndex = %d, want 1 (newest media)", model.mediaPickerIndex)
+	}
+
+	// k moves to the older media item (p2).
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.mediaPickerIndex != 0 {
+		t.Fatalf("mediaPickerIndex = %d, want 0 after k", model.mediaPickerIndex)
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected download command from enter")
+	}
+	result, ok := cmd().(opResultMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("download result = %#v", result)
+	}
+	if transport.downloadedMessage != "p2" {
+		t.Fatalf("downloadedMessage = %q, want p2", transport.downloadedMessage)
+	}
+	if !model.mediaPickerOpen {
+		t.Fatal("expected media picker to stay open after downloading")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.mediaPickerOpen {
+		t.Fatal("expected esc to close the media picker")
+	}
+}
+
+func TestMediaPickerRendersRows(t *testing.T) {
+	t.Parallel()
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	m := selectModeThreadModel(t, transport, []domain.Message{
+		{ID: "doc-1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "[document] brief.pdf",
+			MediaKind: domain.MediaKindDocument, MediaFileName: "brief.pdf", MediaFileLength: 1572864,
+			DownloadedPath: "/tmp/brief.pdf", Timestamp: base},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model := updated.(Model)
+	if !model.mediaPickerOpen {
+		t.Fatal("expected media picker to open")
+	}
+
+	view := model.View()
+	clean := plain(view)
+	for _, needle := range []string{"brief.pdf", "✓", "1.5 MB"} {
+		if !strings.Contains(clean, needle) {
+			t.Fatalf("media picker view missing %q:\n%s", needle, clean)
+		}
+	}
+	assertViewFitsWidth(t, view, model.width)
+	assertViewAvoidsAutowrapColumn(t, view, model.width, model.height)
+	if got := countRenderedLines(view); got != model.height {
+		t.Fatalf("view height = %d, want %d", got, model.height)
+	}
+}
+
+func TestMediaPickerWithoutMediaSetsError(t *testing.T) {
+	t.Parallel()
+
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	m := selectModeThreadModel(t, transport, []domain.Message{
+		{ID: "t1", ChatJID: "project-alpha@g.us", SenderJID: "a@s.whatsapp.net", Text: "just text", Timestamp: base},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model := updated.(Model)
+	if model.mediaPickerOpen {
+		t.Fatal("did not expect the media picker to open without media")
+	}
+	if model.lastErr == "" {
+		t.Fatal("expected lastErr when there is no media to browse")
+	}
+}

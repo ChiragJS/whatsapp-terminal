@@ -654,20 +654,20 @@ func TestReactModeSendsQuickReaction(t *testing.T) {
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 	model := updated.(Model)
-	if !model.reacting || model.reactIndex != 4 {
-		t.Fatalf("reacting = %v, reactIndex = %d; want react mode on newest message", model.reacting, model.reactIndex)
+	if !model.selecting || model.selectIndex != 4 {
+		t.Fatalf("selecting = %v, selectIndex = %d; want select mode on newest message", model.selecting, model.selectIndex)
 	}
 
 	// Move the cursor up one message, then send 😂 (slot 3).
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	model = updated.(Model)
-	if model.reactIndex != 3 {
-		t.Fatalf("reactIndex = %d, want 3 after k", model.reactIndex)
+	if model.selectIndex != 3 {
+		t.Fatalf("selectIndex = %d, want 3 after k", model.selectIndex)
 	}
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
 	model = updated.(Model)
-	if model.reacting {
-		t.Fatal("react mode should exit after sending")
+	if model.selecting {
+		t.Fatal("select mode should exit after sending")
 	}
 	if cmd == nil {
 		t.Fatal("expected reaction command")
@@ -797,25 +797,25 @@ func TestReactCursorReanchorsAfterReload(t *testing.T) {
 	model := updated.(Model)
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	model = updated.(Model)
-	targetID := model.messages[model.reactIndex].ID
+	targetID := model.messages[model.selectIndex].ID
 
 	// Reload arrives with the two oldest messages dropped and two new ones
 	// appended (capped-window shape): indexes shift by two.
 	reloaded := makeThreadMessages(m.currentChatID, 12)[2:]
 	updated, _ = model.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: reloaded, limit: messageLimit})
 	model = updated.(Model)
-	if !model.reacting {
-		t.Fatal("react mode should survive a reload that keeps the target")
+	if !model.selecting {
+		t.Fatal("select mode should survive a reload that keeps the target")
 	}
-	if got := model.messages[model.reactIndex].ID; got != targetID {
-		t.Fatalf("react cursor now points at %q, want re-anchored to %q", got, targetID)
+	if got := model.messages[model.selectIndex].ID; got != targetID {
+		t.Fatalf("select cursor now points at %q, want re-anchored to %q", got, targetID)
 	}
 
-	// A reload that drops the target exits react mode instead of guessing.
+	// A reload that drops the target exits select mode instead of guessing.
 	updated, _ = model.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: makeThreadMessages(m.currentChatID, 3), limit: messageLimit})
 	model = updated.(Model)
-	if model.reacting {
-		t.Fatal("react mode must exit when the target message disappears")
+	if model.selecting {
+		t.Fatal("select mode must exit when the target message disappears")
 	}
 }
 
