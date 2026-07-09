@@ -35,7 +35,6 @@ const (
 	threadMouseScroll    = 3
 	maxPathSuggestions   = 5
 	chatItemLineCount    = 2
-	chatListHelpText     = "j/k move  enter open  / search  r refresh  T theme  ? help  esc·q quit"
 	smallCapRuleMargin   = 6
 )
 
@@ -55,6 +54,14 @@ type spinnerTickMsg struct{}
 
 func spinnerTickCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
+
+// keymapReloadTickMsg fires the periodic poll for external edits to the
+// keybindings file.
+type keymapReloadTickMsg struct{}
+
+func keymapReloadTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return keymapReloadTickMsg{} })
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -204,6 +211,14 @@ type Model struct {
 	themeName            string
 	chatListLimit        int
 	logger               *slog.Logger
+
+	keymap            Keymap
+	keyIndex          keymapIndex
+	keymapProblems    []string
+	keymapModTime     time.Time
+	keymapEditorOpen  bool
+	keymapEditorIndex int
+	keymapCapture     bool
 }
 
 // NewModel builds a Model wired to the system clipboard, terminal bell, and
@@ -222,7 +237,7 @@ func NewModel(repo *appstore.Store, transport domain.Transport) Model {
 	composer.SetHeight(1)
 	composer.SetWidth(48)
 
-	return Model{
+	m := Model{
 		repo:          repo,
 		transport:     transport,
 		events:        transport.Events(),
@@ -238,7 +253,10 @@ func NewModel(repo *appstore.Store, transport domain.Transport) Model {
 		filePickerDir: defaultPickerDir(),
 		themeName:     currentTheme.Name,
 		chatListLimit: defaultChatListLimit,
+		keymap:        DefaultKeymap(),
 	}
+	m.keyIndex = buildKeymapIndex(m.keymap)
+	return m
 }
 
 // WithClipboard overrides the clipboard reader. Nil keeps the current one.
@@ -328,6 +346,25 @@ func (m Model) WithDataDir(dir string) Model {
 	return m
 }
 
+// WithKeymap loads the persisted keybindings from dataDir (writing the default
+// file if none exists), installs them, and records any validation problems in
+// the status line. Invalid entries are reverted to their defaults.
+func (m Model) WithKeymap(dataDir string) Model {
+	m.dataDir = dataDir
+	km, problems := LoadKeymap(dataDir)
+	EnsureKeymapFile(dataDir)
+	m.keymap = km
+	m.keyIndex = buildKeymapIndex(km)
+	m.keymapProblems = problems
+	if t, ok := keymapFileInfo(dataDir); ok {
+		m.keymapModTime = t
+	}
+	if len(problems) > 0 {
+		m.lastErr = fmt.Sprintf("keybindings: %d invalid entries reverted to defaults", len(problems))
+	}
+	return m
+}
+
 // WithTheme switches the active theme. The slug is resolved via LookupTheme;
 // unknown slugs leave the previous theme in place.
 func (m Model) WithTheme(slug string) Model {
@@ -339,7 +376,11 @@ func (m Model) WithTheme(slug string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(tea.ClearScreen, waitForTransportEvent(m.events), m.loadChats(""))
+	cmds := []tea.Cmd{tea.ClearScreen, waitForTransportEvent(m.events), m.loadChats("")}
+	if m.dataDir != "" {
+		cmds = append(cmds, keymapReloadTickCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) WithQuitAfterNavigation(enabled bool) Model {
@@ -361,6 +402,30 @@ func (m Model) requestQuit() (tea.Model, tea.Cmd) {
 	m.clearPendingAttachments()
 	m.quitArmed = false
 	return m, tea.Quit
+}
+
+// handleKeymapReloadTick polls the keybindings file for external edits and
+// hot-reloads them. It never reloads mid-capture (that would clobber an
+// in-flight edit) and always reschedules itself.
+func (m Model) handleKeymapReloadTick() (tea.Model, tea.Cmd) {
+	if m.dataDir == "" {
+		return m, nil
+	}
+	if m.keymapCapture {
+		return m, keymapReloadTickCmd()
+	}
+	if t, ok := keymapFileInfo(m.dataDir); ok && !t.Equal(m.keymapModTime) {
+		km, problems := LoadKeymap(m.dataDir)
+		m.keymap = km
+		m.keyIndex = buildKeymapIndex(km)
+		m.keymapModTime = t
+		m.keymapProblems = problems
+		if len(problems) > 0 {
+			m.lastErr = fmt.Sprintf("keybindings: %d invalid entries reverted to defaults", len(problems))
+		}
+		m.status = "Keybindings reloaded"
+	}
+	return m, keymapReloadTickCmd()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -525,6 +590,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.spinnerFrame++
 		return m, spinnerTickCmd()
+	case keymapReloadTickMsg:
+		return m.handleKeymapReloadTick()
 	case attachmentStagedMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
@@ -543,28 +610,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshPathSuggestions()
 		return m, nil
 	case tea.KeyMsg:
+		// ctrl+c always quits, even inside modal overlays and capture mode.
+		if msg.String() == "ctrl+c" {
+			return m.requestQuit()
+		}
+		if m.keymapEditorOpen {
+			return m.updateKeymapEditor(msg)
+		}
 		if m.helpOpen {
 			switch msg.String() {
-			case "ctrl+c":
-				return m.requestQuit()
 			case "esc", "q", "?", "enter":
 				m.helpOpen = false
 			}
 			return m, nil
 		}
-		switch msg.String() {
-		case "?":
-			// Not while typing: "?" must stay typeable in search and compose.
-			if m.canQuitWithKey() {
-				m.helpOpen = true
-				return m, nil
+		// Global actions resolve from the keymap and work in every context.
+		if action, ok := m.keyIndex.actionFor(contextGlobal, msg.String()); ok {
+			switch action {
+			case ActionGlobalHelp:
+				// Not while typing: help key must stay typeable in search/compose.
+				if m.canQuitWithKey() {
+					m.helpOpen = true
+					return m, nil
+				}
+			case ActionGlobalRepaint:
+				// Manual full repaint: recovers the screen if the terminal ever
+				// desynchronizes (glyph-width mismatch, resize glitch, ssh noise).
+				return m, tea.ClearScreen
+			case ActionGlobalKeybindings:
+				if m.canOpenKeymapEditor() {
+					m.openKeymapEditor()
+					return m, nil
+				}
 			}
-		case "ctrl+c":
-			return m.requestQuit()
-		case "ctrl+l":
-			// Manual full repaint: recovers the screen if the terminal ever
-			// desynchronizes (glyph-width mismatch, resize glitch, ssh noise).
-			return m, tea.ClearScreen
+		}
+		switch msg.String() {
 		case "q":
 			if m.quitArmed && m.canQuitWithKey() {
 				return m.requestQuit()
@@ -594,6 +674,9 @@ func (m Model) View() string {
 	}
 	if m.helpOpen {
 		return m.fitFrame(m.renderHelp())
+	}
+	if m.keymapEditorOpen {
+		return m.fitFrame(m.renderKeymapEditor())
 	}
 
 	switch m.mode {
@@ -625,25 +708,30 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.loadChats(m.search.Value())
 		}
 
-		switch msg.String() {
-		case "esc":
+		if msg.String() == "esc" {
 			m.quitArmed = true
 			return m, nil
-		case "/":
+		}
+		action, ok := m.keyIndex.actionFor(contextChatList, msg.String())
+		if !ok {
+			return m, nil
+		}
+		switch action {
+		case ActionChatSearch:
 			m.searching = true
 			m.search.Focus()
 			return m, nil
-		case "j", "down":
+		case ActionChatDown:
 			m.selected = clampSelection(m.selected+1, len(m.chats))
 			m.keepSelectedChatVisible()
 			return m, nil
-		case "k", "up":
+		case ActionChatUp:
 			m.selected = clampSelection(m.selected-1, len(m.chats))
 			m.keepSelectedChatVisible()
 			return m, nil
-		case "r":
+		case ActionChatRefresh:
 			return m, m.loadChats(m.search.Value())
-		case "t", "T":
+		case ActionChatTheme:
 			next := nextTheme(m.themeName)
 			applyTheme(next)
 			m.themeName = next.Name
@@ -652,14 +740,14 @@ func (m Model) updateChatList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				SaveThemeName(m.dataDir, next.Name)
 			}
 			return m, nil
-		case "D":
+		case ActionChatDiagnostics:
 			// Diagnostic dump: write the raw state of every loaded chat to
 			// the debug log so we can trace title/sender weirdness from a
 			// real cache without screen-scraping the TUI.
 			m.dumpChatListDiagnostics()
 			m.status = fmt.Sprintf("Dumped %d chats to debug log", len(m.chats))
 			return m, nil
-		case "enter":
+		case ActionChatOpen:
 			chat := m.currentChat()
 			if chat == nil {
 				return m, nil
@@ -871,6 +959,8 @@ func (m Model) updateFilePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Hardcoded modal keys: exits, literal "+", and suggestion navigation.
+	// These are never rebindable and take priority over compose bindings.
 	switch msg.String() {
 	case "esc":
 		if m.pathSuggestionFocus {
@@ -889,9 +979,6 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-	case "ctrl+o":
-		m.openFilePicker()
-		return m, nil
 	case "+":
 		// Insert directly so "+" always lands in the draft — even if
 		// the textarea is blurred — instead of reading as the attach
@@ -919,19 +1006,29 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pathSuggestionIdx = cycleSelection(m.pathSuggestionIdx, -1, len(m.pathSuggestions))
 			return m, nil
 		}
-	case "ctrl+v":
-		return m, stageClipboardImageCmd(m.clipboard, m.nextImagePlaceholder())
-	case "alt+v":
-		return m.toggleVoiceRecording()
-	case "ctrl+j", "alt+enter", "shift+enter":
-		// ctrl+j is the reliable newline: terminals send a plain CR for
-		// shift+enter, indistinguishable from enter, so "shift+enter" only
-		// fires in the rare setups that report it distinctly.
-		m.composer.InsertString("\n")
-		m.refreshPathSuggestions()
-		return m, nil
-	case "enter":
-		return m.submitComposer()
+	}
+
+	// Rebindable compose actions. Only intercept when a binding matches so
+	// typing plain characters still reaches the textarea.
+	if action, ok := m.keyIndex.actionFor(contextCompose, msg.String()); ok {
+		switch action {
+		case ActionComposeFiles:
+			m.openFilePicker()
+			return m, nil
+		case ActionComposePasteImage:
+			return m, stageClipboardImageCmd(m.clipboard, m.nextImagePlaceholder())
+		case ActionComposeVoice:
+			return m.toggleVoiceRecording()
+		case ActionComposeNewline:
+			// ctrl+j is the reliable newline: terminals send a plain CR for
+			// shift+enter, indistinguishable from enter, so "shift+enter" only
+			// fires in the rare setups that report it distinctly.
+			m.composer.InsertString("\n")
+			m.refreshPathSuggestions()
+			return m, nil
+		case ActionComposeSend:
+			return m.submitComposer()
+		}
 	}
 	var cmd tea.Cmd
 	m.composer, cmd = m.composer.Update(msg)
@@ -981,8 +1078,7 @@ func (m Model) submitComposer() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
+	if msg.String() == "esc" {
 		m.mode = viewChats
 		m.currentChatID = ""
 		m.messages = nil
@@ -996,32 +1092,38 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.threadScroll = 0
 		m.abandonCompose()
 		return m, m.loadChats(m.search.Value())
-	case "i", "tab":
+	}
+	action, ok := m.keyIndex.actionFor(contextThread, msg.String())
+	if !ok {
+		return m, nil
+	}
+	switch action {
+	case ActionThreadCompose:
 		m.composing = true
 		m.refreshPathSuggestions()
 		return m, m.composer.Focus()
-	case "k", "up":
+	case ActionThreadScrollUp:
 		return m.scrollThread(1)
-	case "j", "down":
+	case ActionThreadScrollDown:
 		return m.scrollThread(-1)
-	case "pgup", "ctrl+u":
+	case ActionThreadPageUp:
 		return m.scrollThread(threadPageScroll)
-	case "pgdown", "ctrl+d":
+	case ActionThreadPageDown:
 		return m.scrollThread(-threadPageScroll)
-	case "home":
+	case ActionThreadOldest:
 		return m.scrollThread(max(1, m.maxThreadScroll()))
-	case "end":
+	case ActionThreadLatest:
 		m.threadScroll = 0
 		m.threadNewWhileAway = 0
 		return m, nil
-	case "u":
+	case ActionThreadHistory:
 		if m.currentChatID == "" {
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m, cmd = m.loadOlderThreadMessages()
 		return m, cmd
-	case "d":
+	case ActionThreadDownloadLatest:
 		if m.currentChatID == "" {
 			return m, nil
 		}
@@ -1031,9 +1133,9 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, downloadMediaCmd(m.transport, *latest, m.downloadDir)
-	case "p":
+	case ActionThreadPlay:
 		return m.toggleVoicePlayback()
-	case "r":
+	case ActionThreadSelect:
 		if len(m.messages) == 0 {
 			return m, nil
 		}
@@ -1041,7 +1143,7 @@ func (m Model) updateThreadNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selectIndex = len(m.messages) - 1
 		m.alignScrollToSelectCursor()
 		return m, nil
-	case "m":
+	case ActionThreadMediaPicker:
 		items := m.mediaMessages()
 		if len(items) == 0 {
 			m.lastErr = "no media in the loaded messages"
@@ -1205,7 +1307,7 @@ type chatListViewLayout struct {
 func (m Model) chatListLayout() chatListViewLayout {
 	contentWidth := max(48, m.width-2)
 	header := m.renderHeader("Inbox", "")
-	footer := m.renderFooter(chatListHelpText)
+	footer := m.renderFooter(m.chatListHelpText())
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
 	layout := chatListViewLayout{
 		contentWidth: contentWidth,
@@ -1224,7 +1326,7 @@ func (m Model) chatListLayout() chatListViewLayout {
 
 func (m Model) renderChatList() string {
 	header := m.renderHeader("Inbox", "")
-	footer := m.renderFooter(chatListHelpText)
+	footer := m.renderFooter(m.chatListHelpText())
 	layout := m.chatListLayout()
 	if layout.stacked {
 		width := layout.contentWidth
@@ -1337,36 +1439,35 @@ func (m Model) renderHelp() string {
 	bodyHeight := max(8, m.height-countRenderedLines(header)-countRenderedLines(footer)-1)
 	innerWidth := contentWidth - boxStyle.GetHorizontalFrameSize()
 
-	// Two columns so all four sections fit typical terminal heights.
+	// Two columns so all four sections fit typical terminal heights. Rows are
+	// derived from the live keymap so custom bindings are reflected here.
 	columnWidth := max(20, (innerWidth-4)/2)
-	section := func(title string, rows [][2]string) []string {
+	section := func(title string, ctx keyContext) []string {
 		lines := []string{smallCap(title, columnWidth)}
-		for _, row := range rows {
-			lines = append(lines, actionRow(row[0], row[1], columnWidth))
+		for _, spec := range actionSpecs {
+			if spec.context != ctx {
+				continue
+			}
+			lines = append(lines, actionRow(strings.Join(m.keymap[spec.action], "/"), spec.label, columnWidth))
 		}
 		lines = append(lines, "")
 		return lines
 	}
 	var left []string
-	left = append(left, section("Inbox", [][2]string{
-		{"j/k", "move selection"}, {"enter", "open thread"}, {"/", "filter inbox"},
-		{"r", "reload cache"}, {"T", "cycle theme"}, {"esc·q", "quit"},
-	})...)
-	left = append(left, section("Thread", [][2]string{
-		{"j/k", "scroll one line"}, {"pgup/pgdn", "scroll a page"}, {"home/end", "oldest · latest"},
-		{"i·tab", "compose"}, {"u", "load older history"}, {"d", "download latest media"},
-		{"p", "play · stop voice note"}, {"r", "select message (react · save · play)"}, {"m", "browse chat media"},
-		{"esc", "back to inbox"},
-	})...)
+	left = append(left, section("Inbox", contextChatList)...)
+	left = append(left, section("Thread", contextThread)...)
 	var right []string
-	right = append(right, section("Compose", [][2]string{
-		{"enter", "send"}, {"ctrl+j", "newline"}, {"ctrl+o", "file picker"},
-		{"ctrl+v", "paste clipboard image"}, {"alt+v", "record voice note"},
-		{"@name", "tag someone"}, {":code:", "insert emoji"}, {"tab", "suggestions"}, {"esc", "cancel draft"},
-	})...)
-	right = append(right, section("Global", [][2]string{
-		{"?", "this help"}, {"ctrl+l", "force repaint"}, {"ctrl+c", "quit"},
-	})...)
+	right = append(right, section("Compose", contextCompose)...)
+	// Not rebindable — these are fixed syntax, not key bindings — but still
+	// worth surfacing so they stay discoverable from the help overlay.
+	right = append(right,
+		actionRow("@name", "tag someone", columnWidth),
+		actionRow(":code:", "insert emoji", columnWidth),
+		actionRow("tab", "suggestions", columnWidth),
+		actionRow("esc", "cancel draft", columnWidth),
+		"",
+	)
+	right = append(right, section("Global", contextGlobal)...)
 
 	rows := max(len(left), len(right))
 	body := make([]string, 0, rows)
@@ -1386,6 +1487,21 @@ func (m Model) renderHelp() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, panel, footer)
 }
 
+// chatListHelpText builds the chat-list footer chips from the live keymap.
+func (m Model) chatListHelpText() string {
+	km := m.keymap
+	parts := []string{
+		keyLabel(km[ActionChatDown]) + "/" + keyLabel(km[ActionChatUp]) + " move",
+		keyLabel(km[ActionChatOpen]) + " open",
+		keyLabel(km[ActionChatSearch]) + " search",
+		keyLabel(km[ActionChatRefresh]) + " refresh",
+		keyLabel(km[ActionChatTheme]) + " theme",
+		keyLabel(km[ActionGlobalHelp]) + " help",
+		"esc·q quit",
+	}
+	return strings.Join(parts, "  ")
+}
+
 func (m Model) threadHelpText() string {
 	if m.mediaPickerOpen {
 		return "enter·d save  p play  j/k move  esc close"
@@ -1393,13 +1509,27 @@ func (m Model) threadHelpText() string {
 	if m.selecting {
 		return "1-6 react  x unreact  d save  p play  j/k pick  esc done"
 	}
+	km := m.keymap
 	if m.composing {
+		base := keyLabel(km[ActionComposeSend]) + " send  " +
+			keyLabel(km[ActionComposeNewline]) + " newline  esc cancel  " +
+			keyLabel(km[ActionComposeFiles]) + " files  " +
+			keyLabel(km[ActionComposeVoice]) + " voice  " +
+			keyLabel(km[ActionComposePasteImage]) + " paste"
 		if m.quitAfterNavigation {
-			return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste  esc·q quit"
+			return base + "  esc·q quit"
 		}
-		return "enter send  ctrl+j newline  esc cancel  ctrl+o files  alt+v voice  ctrl+v paste"
+		return base
 	}
-	return "esc back  j/k scroll  i compose  r select  m media  u history  d download  p play  ? help"
+	return "esc back  " +
+		keyLabel(km[ActionThreadScrollDown]) + "/" + keyLabel(km[ActionThreadScrollUp]) + " scroll  " +
+		keyLabel(km[ActionThreadCompose]) + " compose  " +
+		keyLabel(km[ActionThreadSelect]) + " select  " +
+		keyLabel(km[ActionThreadMediaPicker]) + " media  " +
+		keyLabel(km[ActionThreadHistory]) + " history  " +
+		keyLabel(km[ActionThreadDownloadLatest]) + " download  " +
+		keyLabel(km[ActionThreadPlay]) + " play  " +
+		keyLabel(km[ActionGlobalHelp]) + " help"
 }
 
 func (m Model) currentChat() *domain.ChatSummary {

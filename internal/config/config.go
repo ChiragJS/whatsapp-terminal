@@ -20,6 +20,7 @@ type Config struct {
 	NoAltScreen            bool
 	ArmQuitAfterNavigation bool
 	ShowVersion            bool
+	CheckKeybindings       bool
 }
 
 func Parse() (Config, error) {
@@ -41,6 +42,7 @@ func Parse() (Config, error) {
 	flag.BoolVar(&cfg.Stress, "stress", false, "seed an oversized demo dataset to stress-test the TUI (requires --demo)")
 	flag.BoolVar(&cfg.ResetCache, "reset-cache", false, "delete the local message cache (app.db) before startup; preserves pairing, theme, and downloads")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version information and exit")
+	flag.BoolVar(&cfg.CheckKeybindings, "check-keybindings", false, "validate the keybindings file and exit")
 	flag.Parse()
 
 	if cfg.ShowVersion {

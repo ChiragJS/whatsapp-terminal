@@ -19,6 +19,10 @@ import (
 )
 
 func Run(ctx context.Context, cfg config.Config) error {
+	if cfg.CheckKeybindings {
+		return checkKeybindings(cfg)
+	}
+
 	logOutput, closeLog, err := openLogSink(cfg)
 	if err != nil {
 		return err
@@ -60,6 +64,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		WithQuitAfterNavigation(cfg.ArmQuitAfterNavigation).
 		WithForceRepaint(cfg.NoAltScreen).
 		WithDataDir(cfg.DataDir).
+		WithKeymap(cfg.DataDir).
 		WithTheme(themeSlug).
 		WithChatListLimit(cfg.ChatListLimit).
 		WithLogger(logger.With("component", "ui"))
@@ -82,6 +87,22 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("run TUI: %w", err)
 	}
 	return nil
+}
+
+// checkKeybindings validates the keybindings file and reports the result on
+// stdout. It returns a non-nil error when problems exist so the process exits
+// non-zero.
+func checkKeybindings(cfg config.Config) error {
+	_, problems := ui.LoadKeymap(cfg.DataDir)
+	path := filepath.Join(cfg.DataDir, "keybindings.json")
+	if len(problems) == 0 {
+		fmt.Printf("keybindings OK (%s)\n", path)
+		return nil
+	}
+	for _, p := range problems {
+		fmt.Println(p)
+	}
+	return fmt.Errorf("keybindings validation failed: %d problem(s)", len(problems))
 }
 
 func chooseTransport(cfg config.Config, repo *appstore.Store, logger *slog.Logger) domain.Transport {

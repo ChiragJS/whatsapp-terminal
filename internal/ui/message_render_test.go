@@ -472,11 +472,11 @@ func TestFooterShowsTransportStatus(t *testing.T) {
 	m.ready = true
 	m.status = "History sync updated"
 
-	if footer := plain(m.renderFooter(chatListHelpText)); !strings.Contains(footer, "History sync updated") {
+	if footer := plain(m.renderFooter(m.chatListHelpText())); !strings.Contains(footer, "History sync updated") {
 		t.Fatalf("footer missing status line:\n%s", footer)
 	}
 	m.lastErr = "boom"
-	if footer := plain(m.renderFooter(chatListHelpText)); !strings.Contains(footer, "boom") {
+	if footer := plain(m.renderFooter(m.chatListHelpText())); !strings.Contains(footer, "boom") {
 		t.Fatalf("footer must prioritize errors:\n%s", footer)
 	}
 }
