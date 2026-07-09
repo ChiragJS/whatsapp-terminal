@@ -283,26 +283,38 @@ func TestComposerSingleLongLineShowsAllWrappedRows(t *testing.T) {
 	waitForSubstring(t, &out, marker)
 	time.Sleep(300 * time.Millisecond)
 
-	// bubbletea's renderer only reprints lines that changed, so anchor on
-	// the marker's last occurrence and walk back to the nearest preceding
-	// box-top-left corner ("┌"), which only appears on a full repaint —
-	// exactly the technique verified in TestComposerLongDraftScrollsToLatestLine.
-	snapshot := out.String()
-	anchor := strings.LastIndex(snapshot, marker)
-	if anchor < 0 {
-		t.Fatalf("could not find marker %q despite waitForSubstring succeeding:\n%s", marker, snapshot)
+	// Counting a repeated character like "j" is fragile against raw,
+	// diff-rendered ANSI output: as the second wrapped row grew one
+	// character at a time, bubbletea repainted just that row over and
+	// over ("jj", then "jjjj", then "jjjjjj", ...), and every one of those
+	// historical partial redraws is still sitting in the captured byte
+	// stream. A backward search for the nearest preceding box corner can
+	// land before several of those stale repaints, so a naive count over
+	// that span sums "j"s across multiple obsolete frames instead of the
+	// true final one — this is what made the assertion flaky under CI's
+	// slower, more finely-grained redraw cadence even though the app
+	// itself was rendering correctly. Forcing a genuine full repaint (the
+	// same "ctrl+l" force-repaint global action used to recover a
+	// desynced terminal) and then reading only bytes written after that
+	// point sidesteps the ambiguity entirely: nothing else is being typed
+	// at this moment, so the first full frame to appear afterward is
+	// unambiguously the final, complete state.
+	resetAt := out.Len()
+	if _, err := ptmx.Write([]byte{0x0c}); err != nil { // ctrl+l: force repaint
+		t.Fatalf("write repaint error = %v", err)
 	}
-	frameStart := strings.LastIndex(snapshot[:anchor], "┌")
-	if frameStart < 0 {
-		frameStart = max(0, anchor-3000)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String()[resetAt:], marker) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	// A fixed offset past the marker, not a search for the closing "└": a
-	// redraw that only touches the marker's own line (a cursor blink, say)
-	// can legitimately omit the border entirely if bubbletea's diffing
-	// renderer treats it as unchanged from the previous full frame.
-	frame := snapshot[frameStart:min(len(snapshot), anchor+400)]
+	time.Sleep(150 * time.Millisecond)
+
+	frame := out.String()[resetAt:]
 	if !strings.Contains(frame, marker) {
-		t.Fatalf("frame window lost the marker itself — window logic is wrong:\n%s", frame)
+		t.Fatalf("post-repaint frame never showed marker %q:\n%s", marker, frame)
 	}
 	visibleJs := strings.Count(frame, "j")
 	if visibleJs < jCount {
