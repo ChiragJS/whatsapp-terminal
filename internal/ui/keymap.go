@@ -198,35 +198,49 @@ func ValidateKeymap(raw Keymap) (Keymap, []string) {
 
 	for _, spec := range actionSpecs {
 		rawKeys, present := raw[spec.action]
-		var keys []string
-		if present {
-			for _, key := range rawKeys {
-				k := strings.TrimSpace(key)
-				switch {
-				case k == "":
-					problems = append(problems, fmt.Sprintf("%s: empty key ignored", spec.action))
-				case reserved[k]:
-					problems = append(problems, fmt.Sprintf("%s: reserved key %q ignored", spec.action, k))
-				case keyConflict(spec.context, k, globalKeys, contextKeys):
-					problems = append(problems, fmt.Sprintf("%s: key %q already bound, ignored", spec.action, k))
-				default:
-					keys = append(keys, k)
-					registerKey(spec.context, k, spec.action, globalKeys, contextKeys)
-				}
-			}
-			if len(keys) == 0 {
-				problems = append(problems, fmt.Sprintf("%s: no valid keys, using defaults", spec.action))
-			}
+		keys := acceptKeys(spec, rawKeys, reserved, globalKeys, contextKeys, &problems)
+		if len(keys) == 0 && present {
+			problems = append(problems, fmt.Sprintf("%s: no valid keys, using defaults", spec.action))
 		}
 		if len(keys) == 0 {
-			keys = append(keys, spec.defaults...)
-			for _, k := range spec.defaults {
-				registerKey(spec.context, k, spec.action, globalKeys, contextKeys)
+			// Defaults must run through the identical conflict check, not
+			// an unconditional append: an earlier action's valid custom
+			// rebind can land on a later action's untouched default (both
+			// are ordinary, individually-valid requests — the collision
+			// only exists between them), and skipping the check here would
+			// silently register both under the same key with no reported
+			// problem, leaving the loser a dead entry that never dispatches.
+			keys = acceptKeys(spec, spec.defaults, reserved, globalKeys, contextKeys, &problems)
+			if len(keys) == 0 {
+				problems = append(problems, fmt.Sprintf("%s: default keys unavailable (claimed elsewhere), action is unbound", spec.action))
 			}
 		}
 		clean[spec.action] = keys
 	}
 	return clean, problems
+}
+
+// acceptKeys validates one action's candidate key list against the reserved
+// set and the keys already claimed so far, registering and returning the
+// survivors. Shared by explicit keymap.json entries and the default-fallback
+// path so both go through the same conflict check.
+func acceptKeys(spec actionSpec, candidates []string, reserved map[string]bool, globalKeys map[string]Action, contextKeys map[keyContext]map[string]Action, problems *[]string) []string {
+	var keys []string
+	for _, key := range candidates {
+		k := strings.TrimSpace(key)
+		switch {
+		case k == "":
+			*problems = append(*problems, fmt.Sprintf("%s: empty key ignored", spec.action))
+		case reserved[k]:
+			*problems = append(*problems, fmt.Sprintf("%s: reserved key %q ignored", spec.action, k))
+		case keyConflict(spec.context, k, globalKeys, contextKeys):
+			*problems = append(*problems, fmt.Sprintf("%s: key %q already bound, ignored", spec.action, k))
+		default:
+			keys = append(keys, k)
+			registerKey(spec.context, k, spec.action, globalKeys, contextKeys)
+		}
+	}
+	return keys
 }
 
 // keyConflict reports whether key is already claimed in a way that would clash

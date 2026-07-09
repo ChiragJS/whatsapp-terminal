@@ -134,6 +134,42 @@ func TestValidateKeymap(t *testing.T) {
 		}
 		assertComplete(t, clean)
 	})
+
+	// This scenario does not use assertComplete: it deliberately produces an
+	// action with zero keys, which is the correct outcome here (see below),
+	// not a case the "every action has keys" invariant applies to.
+	t.Run("valid rebind onto another action's untouched default is caught, not silently ghosted", func(t *testing.T) {
+		t.Parallel()
+		// chat.down is validly rebound onto "r"; chat.refresh is absent from
+		// raw entirely, so it falls back to its own default, which is also
+		// "r". Both requests are individually valid — the collision only
+		// exists between them — so this must be caught by the SAME
+		// conflict check the explicit-entry path uses, not skipped because
+		// one side arrived via the default-fallback path.
+		clean, problems := ValidateKeymap(Keymap{ActionChatDown: {"r"}})
+		if !reflect.DeepEqual(clean[ActionChatDown], []string{"r"}) {
+			t.Fatalf("chat.down = %v, want [r] (the valid rebind should win)", clean[ActionChatDown])
+		}
+		if len(clean[ActionChatRefresh]) != 0 {
+			t.Fatalf("chat.refresh = %v, want unbound — its default collided and must not silently share \"r\"", clean[ActionChatRefresh])
+		}
+		if !containsSubstr(problems, "already bound") {
+			t.Fatalf("problems = %v, want a conflict report naming the contested default", problems)
+		}
+
+		// The keymap must stay internally consistent: whichever action
+		// clean{} says holds "r" must be the one dispatch actually resolves
+		// to. Before this fix, both actions ended up listing "r" in clean{}
+		// with no problem reported, while the index (built by iterating in
+		// the same fixed action order) silently gave the key to whichever
+		// action happened to be declared later — a ghost binding on the
+		// loser that never fired and no diagnostic explaining why.
+		idx := buildKeymapIndex(clean)
+		action, ok := idx.actionFor(contextChatList, "r")
+		if !ok || action != ActionChatDown {
+			t.Fatalf("dispatch for \"r\" = %v (ok=%v), want chat.down, matching what clean{} reports", action, ok)
+		}
+	})
 }
 
 func TestLoadKeymapBadJSONKeepsFileAndReturnsDefaults(t *testing.T) {
@@ -294,6 +330,52 @@ func TestKeymapEditorResetRestoresDefault(t *testing.T) {
 	onDisk := readKeymapFile(t, dir)
 	if !reflect.DeepEqual(onDisk[ActionChatRefresh], []string{"r"}) {
 		t.Fatalf("persisted chat.refresh = %v, want default [r]", onDisk[ActionChatRefresh])
+	}
+}
+
+func TestKeymapEditorResetRejectsCollisionWithRebindElsewhere(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 100
+	m.height = 30
+	m.ready = true
+	m = m.WithDataDir(dir)
+
+	// chat.refresh has moved off its default "r", freeing it up for
+	// chat.down to claim via an explicit rebind.
+	km := DefaultKeymap()
+	km[ActionChatRefresh] = []string{"g"}
+	km[ActionChatDown] = []string{"r"}
+	m = withKeymap(m, km)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlK})
+	model := updated.(Model)
+	model.keymapEditorIndex = actionSpecIndex(t, ActionChatRefresh)
+
+	// Resetting chat.refresh to its default ("r") must not silently clobber
+	// chat.down's live binding of the same key.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model = updated.(Model)
+
+	if len(model.keymap[ActionChatRefresh]) != 0 {
+		t.Fatalf("chat.refresh = %v, want unbound — its default collided and must not silently share \"r\"", model.keymap[ActionChatRefresh])
+	}
+	if !reflect.DeepEqual(model.keymap[ActionChatDown], []string{"r"}) {
+		t.Fatalf("chat.down = %v, want unchanged [r]", model.keymap[ActionChatDown])
+	}
+	if !strings.Contains(model.lastErr, "already bound") {
+		t.Fatalf("lastErr = %q, want an already-bound conflict", model.lastErr)
+	}
+	if action, ok := model.keyIndex.actionFor(contextChatList, "r"); !ok || action != ActionChatDown {
+		t.Fatalf("dispatch for \"r\" = %v (ok=%v), want chat.down, matching what clean{} reports", action, ok)
+	}
+
+	onDisk := readKeymapFile(t, dir)
+	if len(onDisk[ActionChatRefresh]) != 0 {
+		t.Fatalf("persisted chat.refresh = %v, want unbound", onDisk[ActionChatRefresh])
 	}
 }
 

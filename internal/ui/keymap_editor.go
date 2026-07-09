@@ -77,13 +77,32 @@ func (m Model) captureKeymapBinding(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // resetKeymapAction restores the selected action to its default binding and
-// persists the change.
+// persists the change. Defaults that now collide with another action's
+// current (possibly rebound) key are dropped rather than silently
+// overwriting m.keymap with a self-conflicting state that buildKeymapIndex
+// would then resolve inconsistently.
 func (m Model) resetKeymapAction() (tea.Model, tea.Cmd) {
 	spec := actionSpecs[clampSelection(m.keymapEditorIndex, len(actionSpecs))]
-	m.keymap[spec.action] = append([]string(nil), spec.defaults...)
+	var kept []string
+	var dropped string
+	for _, key := range spec.defaults {
+		if label, clash := m.bindingConflict(spec.context, key, spec.action); clash {
+			dropped = fmt.Sprintf("%q already bound to %s", key, label)
+			continue
+		}
+		kept = append(kept, key)
+	}
+	m.keymap[spec.action] = kept
 	m.keyIndex = buildKeymapIndex(m.keymap)
 	m.persistKeymap()
-	m.status = fmt.Sprintf("%s reset to default", spec.label)
+	switch {
+	case len(kept) == 0:
+		m.lastErr = fmt.Sprintf("%s default %s, left unbound", spec.label, dropped)
+	case dropped != "":
+		m.status = fmt.Sprintf("%s reset to default (%s)", spec.label, dropped)
+	default:
+		m.status = fmt.Sprintf("%s reset to default", spec.label)
+	}
 	return m, nil
 }
 
