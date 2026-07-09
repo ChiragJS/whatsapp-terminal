@@ -36,6 +36,7 @@ type fakeTransport struct {
 	reactionTargetSender string
 	reactionTargetID     string
 	reactionEmoji        string
+	sentMentions         []string
 }
 
 type fakeClipboard struct {
@@ -61,9 +62,10 @@ type fakeVoiceRecorder struct {
 func (f *fakeTransport) Start(context.Context) error { return nil }
 func (f *fakeTransport) Stop() error                 { return nil }
 func (f *fakeTransport) Events() <-chan domain.Event { return f.events }
-func (f *fakeTransport) SendText(_ context.Context, chatJID, text string) error {
+func (f *fakeTransport) SendText(_ context.Context, chatJID, text string, mentionJIDs ...string) error {
 	f.sentChatJID = chatJID
 	f.sentText = text
+	f.sentMentions = mentionJIDs
 	return nil
 }
 func (f *fakeTransport) SendImage(_ context.Context, chatJID, path, caption string) error {

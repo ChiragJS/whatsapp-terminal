@@ -62,22 +62,25 @@ var emojiByName = func() map[string]string {
 	return byName
 }()
 
-// shortcodePattern matches a complete :shortcode: token.
-var shortcodePattern = regexp.MustCompile(`:([a-z0-9_+-]+):`)
-
 // trailingShortcodePrefix matches an unfinished shortcode at the end of the
 // draft — the trigger for emoji suggestions.
 var trailingShortcodePrefix = regexp.MustCompile(`:([a-z0-9_+-]{2,})$`)
 
-// replaceEmojiShortcodes swaps every known :shortcode: in text for its
-// emoji. Unknown codes are left untouched.
-func replaceEmojiShortcodes(text string) string {
-	return shortcodePattern.ReplaceAllStringFunc(text, func(token string) string {
-		if emoji, ok := emojiByName[strings.Trim(token, ":")]; ok {
-			return emoji
-		}
-		return token
-	})
+// trailingCompletedShortcode matches a just-finished :shortcode: at the end
+// of the draft.
+var trailingCompletedShortcode = regexp.MustCompile(`:([a-z0-9_+-]+):$`)
+
+// replaceTrailingEmojiShortcode swaps a completed :shortcode: at the end of
+// the draft for its emoji. Unknown codes are left untouched.
+func replaceTrailingEmojiShortcode(text string) string {
+	match := trailingCompletedShortcode.FindStringSubmatch(text)
+	if match == nil {
+		return text
+	}
+	if emoji, ok := emojiByName[match[1]]; ok {
+		return text[:len(text)-len(match[0])] + emoji
+	}
+	return text
 }
 
 // emojiSuggestions offers completions while the draft ends in an unfinished

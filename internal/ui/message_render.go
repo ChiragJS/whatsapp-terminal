@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"hash/fnv"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -233,11 +234,26 @@ func humanFileSize(bytes uint64) string {
 	}
 }
 
-// isMediaPlaceholderText reports whether the message text is just the
-// bracketed media placeholder ("[image]", "[voice note] rec.ogg"), in which
-// case the media chip already carries all its information.
+// isMediaPlaceholderText reports whether the message text is exactly a
+// synthetic media placeholder ("[image]", "[voice note] rec.ogg"), in which
+// case the media chip already carries all its information. Anything beyond
+// the placeholder — captions in particular, even ones that happen to start
+// with '[' — must render.
 func isMediaPlaceholderText(msg domain.Message) bool {
-	return msg.MediaKind != domain.MediaKindNone && strings.HasPrefix(strings.TrimSpace(msg.Text), "[")
+	if msg.MediaKind == domain.MediaKindNone {
+		return false
+	}
+	text := strings.TrimSpace(msg.Text)
+	labels := []string{"[" + string(msg.MediaKind) + "]", "[voice note]"}
+	for _, label := range labels {
+		if text == label {
+			return true
+		}
+		if name := strings.TrimSpace(msg.MediaFileName); name != "" && text == label+" "+name {
+			return true
+		}
+	}
+	return false
 }
 
 // receiptTicks renders delivery state as compact ticks on the message
@@ -336,7 +352,7 @@ func renderThreadMessage(msg domain.Message, width int, mentions map[string]stri
 		lines = append(lines, reactions)
 	}
 	if msg.DownloadedPath != "" {
-		lines = append(lines, subtleStyle.Render("↳ saved · "+truncateText(msg.DownloadedPath, max(8, width-10))))
+		lines = append(lines, subtleStyle.Render("↳ saved · "+truncateText(filepath.Base(msg.DownloadedPath), max(8, width-10))))
 	}
 	if msg.FromMe {
 		for i, line := range lines {

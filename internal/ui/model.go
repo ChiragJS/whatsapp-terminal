@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -125,6 +126,10 @@ type pathSuggestion struct {
 	label       string
 	replacement string
 	isDir       bool
+	// mentionName/mentionJID are set on @-mention suggestions so applying
+	// one records who was tagged for the send-time context info.
+	mentionName string
+	mentionJID  string
 }
 
 type filePickerEntry struct {
@@ -189,7 +194,8 @@ type Model struct {
 	threadNewWhileAway   int
 	reacting             bool
 	reactIndex           int
-	suggestionsAreEmoji  bool
+	suggestionsKind      string
+	draftMentions        map[string]string
 	quitArmed            bool
 	quitAfterNavigation  bool
 	dataDir              string
@@ -422,18 +428,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.threadMessageLimit == 0 {
 				m.threadMessageLimit = messageLimit
 			}
-			previousCount := len(m.messages)
+			reactTargetID := ""
+			if m.reacting && m.reactIndex >= 0 && m.reactIndex < len(m.messages) {
+				reactTargetID = m.messages[m.reactIndex].ID
+			}
 			m.messages = msg.messages
 			m.mentionNames = msg.mentions
+			m.reanchorReactCursor(reactTargetID)
+			// Count messages appended after the previous newest by walking
+			// back to its ID. A capped reload drops rows from the top, so
+			// slice-length deltas undercount arrivals.
+			appended := 0
+			if previousNewestID != "" {
+				for i := len(msg.messages) - 1; i >= 0; i-- {
+					if msg.messages[i].ID == previousNewestID {
+						break
+					}
+					appended++
+				}
+				if appended == len(msg.messages) {
+					// Previous newest vanished: full reload, not an append.
+					appended = 0
+				}
+			}
 			newLineCount := len(m.threadMessageLines(lineWidth))
 			if wasAtBottom {
 				m.threadScroll = 0
-			} else if previousNewestID != "" && newestMessageID(msg.messages) != previousNewestID && newLineCount > previousLineCount {
-				// New messages appended at the bottom while scrolled up:
-				// grow the offset so the view keeps showing the same lines,
-				// and count them for the "N new" hint.
-				m.threadScroll += newLineCount - previousLineCount
-				m.threadNewWhileAway += max(0, len(msg.messages)-previousCount)
+			} else if appended > 0 {
+				// Grow the offset by the appended blocks' real line count so
+				// the view keeps showing the same lines, and count the new
+				// messages for the "N new" hint.
+				added := newLineCount - previousLineCount
+				if added <= 0 {
+					_, ends := m.threadMessageBlocks(lineWidth)
+					added = newLineCount - ends[len(msg.messages)-appended-1]
+				}
+				m.threadScroll += added
+				m.threadNewWhileAway += appended
 			}
 			m.threadScroll = min(max(0, m.threadScroll), m.maxThreadScroll())
 			if m.threadScroll == 0 {
@@ -468,6 +499,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			if msg.clearComposer {
 				m.composer.SetValue("")
+				m.draftMentions = nil
 			}
 			if msg.clearAttachments {
 				m.clearPendingAttachments()
@@ -684,28 +716,55 @@ func (m Model) updateReactKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.reactIndex = clampSelection(m.reactIndex+1, len(m.messages))
 		m.alignScrollToReactCursor()
 		return m, nil
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "x":
+		if m.reactIndex < 0 || m.reactIndex >= len(m.messages) {
+			m.reacting = false
+			return m, nil
+		}
 		target := m.messages[m.reactIndex]
 		m.reacting = false
-		return m, sendReactionCmd(m.transport, target, quickReactions[int(key[0]-'1')])
-	case "x":
-		target := m.messages[m.reactIndex]
-		m.reacting = false
-		return m, sendReactionCmd(m.transport, target, "")
+		emoji := ""
+		if key != "x" {
+			emoji = quickReactions[int(key[0]-'1')]
+		}
+		return m, sendReactionCmd(m.transport, target, emoji)
 	}
 	return m, nil
 }
 
 // alignScrollToReactCursor keeps the react-mode cursor visible by scrolling
-// so the selected message sits at the bottom of the viewport.
+// so the selected message sits at the bottom of the viewport. It derives the
+// offset from the real block layout, so date separators are accounted for.
 func (m *Model) alignScrollToReactCursor() {
+	if len(m.messages) == 0 || m.reactIndex < 0 || m.reactIndex >= len(m.messages) {
+		return
+	}
 	layout := m.threadLayout()
 	width := layout.contentWidth - boxStyle.GetHorizontalFrameSize()
-	below := 0
-	for i := len(m.messages) - 1; i > m.reactIndex; i-- {
-		below += countRenderedLines(renderThreadMessage(m.messages[i], width, m.mentionNames, false)) + 1
+	lines, ends := m.threadMessageBlocks(width)
+	below := len(lines) - ends[m.reactIndex]
+	maxScroll := max(0, len(lines)-paddedContentHeight(layout.messageHeight))
+	m.threadScroll = min(below, maxScroll)
+}
+
+// reanchorReactCursor re-points the react-mode cursor at the same message
+// after m.messages is replaced: a background reload can shift indexes or
+// drop the target entirely, and a stale index would react to the wrong
+// message. Exits react mode when the target is gone.
+func (m *Model) reanchorReactCursor(targetID string) {
+	if !m.reacting {
+		return
 	}
-	m.threadScroll = min(below, m.maxThreadScroll())
+	if targetID != "" {
+		for i, msg := range m.messages {
+			if msg.ID == targetID {
+				m.reactIndex = i
+				return
+			}
+		}
+	}
+	m.reacting = false
+	m.reactIndex = 0
 }
 
 // sendReactionCmd sends (or with an empty emoji, removes) a reaction to the
@@ -826,9 +885,11 @@ func (m Model) updateComposerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.composer, cmd = m.composer.Update(msg)
 	if msg.String() == ":" {
-		// Closing colon of a :shortcode: — swap known codes for emoji.
-		if value := m.composer.Value(); value != replaceEmojiShortcodes(value) {
-			m.composer.SetValue(replaceEmojiShortcodes(value))
+		// Closing colon of a :shortcode: at the end of the draft. Only the
+		// suffix is eligible: SetValue moves the cursor to the end, which is
+		// correct only when the user was already typing there.
+		if value := m.composer.Value(); value != replaceTrailingEmojiShortcode(value) {
+			m.composer.SetValue(replaceTrailingEmojiShortcode(value))
 		}
 	}
 	m.refreshPathSuggestions()
@@ -863,7 +924,8 @@ func (m Model) submitComposer() (tea.Model, tea.Cmd) {
 	case composeActionMedia:
 		return m, sendMediaCmd(m.transport, chatID, action.path, action.caption)
 	default:
-		return m, sendTextCmd(m.transport, chatID, action.text)
+		text, mentionJIDs := applyDraftMentions(action.text, m.draftMentions)
+		return m, sendTextCmd(m.transport, chatID, text, mentionJIDs)
 	}
 }
 
@@ -964,6 +1026,7 @@ func (m *Model) abandonCompose() {
 	}
 	m.clearPendingAttachments()
 	m.clearPathSuggestions()
+	m.draftMentions = nil
 	m.filePickerOpen = false
 }
 
@@ -1191,7 +1254,8 @@ func (m Model) renderHelp() string {
 	var right []string
 	right = append(right, section("Compose", [][2]string{
 		{"enter", "send"}, {"ctrl+j", "newline"}, {"ctrl+o", "file picker"},
-		{"ctrl+v", "paste clipboard image"}, {"alt+v", "record voice note"}, {"tab", "path suggestions"}, {"esc", "cancel draft"},
+		{"ctrl+v", "paste clipboard image"}, {"alt+v", "record voice note"},
+		{"@name", "tag someone"}, {":code:", "insert emoji"}, {"tab", "suggestions"}, {"esc", "cancel draft"},
 	})...)
 	right = append(right, section("Global", [][2]string{
 		{"?", "this help"}, {"ctrl+l", "force repaint"}, {"ctrl+c", "quit"},
@@ -1537,9 +1601,9 @@ func resetUnreadCmd(repo *appstore.Store, chatJID string) tea.Cmd {
 	}
 }
 
-func sendTextCmd(transport domain.Transport, chatJID, text string) tea.Cmd {
+func sendTextCmd(transport domain.Transport, chatJID, text string, mentionJIDs []string) tea.Cmd {
 	return func() tea.Msg {
-		err := transport.SendText(context.Background(), chatJID, text)
+		err := transport.SendText(context.Background(), chatJID, text, mentionJIDs...)
 		return opResultMsg{err: err, status: "Message sent", chatJID: chatJID, refresh: err == nil, clearComposer: err == nil}
 	}
 }
@@ -2144,17 +2208,24 @@ func actionRow(key, label string, width int) string {
 	return line
 }
 
-// threadMessageLines flattens every cached message into display lines with a
-// blank separator between messages and a date divider at day boundaries.
-// The thread scroll offset is measured in these lines, so scrolling is
-// smooth and long messages are fully reachable.
-func (m Model) threadMessageLines(width int) []string {
+// threadMessageBlocks flattens every cached message into display lines —
+// blank separators between messages, date dividers at day boundaries — and
+// reports the exclusive end line index of each message's block. The thread
+// scroll offset is measured in these lines, so scrolling is smooth and long
+// messages are fully reachable; the block ends let scroll math account for
+// separators exactly.
+func (m Model) threadMessageBlocks(width int) ([]string, []int) {
 	width = max(18, width)
 	now := time.Now()
 	lines := make([]string, 0, len(m.messages)*3)
+	ends := make([]int, len(m.messages))
 	var previousDay time.Time
 	for i, msg := range m.messages {
-		if i > 0 {
+		if hiddenLegacyMessage(msg) {
+			ends[i] = len(lines)
+			continue
+		}
+		if len(lines) > 0 {
 			lines = append(lines, "")
 		}
 		if day := msg.Timestamp.Local(); i == 0 || !sameDay(day, previousDay) {
@@ -2163,8 +2234,21 @@ func (m Model) threadMessageLines(width int) []string {
 		}
 		selected := m.reacting && i == m.reactIndex
 		lines = append(lines, strings.Split(renderThreadMessage(msg, width, m.mentionNames, selected), "\n")...)
+		ends[i] = len(lines)
 	}
+	return lines, ends
+}
+
+func (m Model) threadMessageLines(width int) []string {
+	lines, _ := m.threadMessageBlocks(width)
 	return lines
+}
+
+// hiddenLegacyMessage reports message rows an older build stored for
+// incoming reactions. They carry no usable content; hiding them at render
+// keeps the store's never-delete-messages invariant intact.
+func hiddenLegacyMessage(msg domain.Message) bool {
+	return msg.Text == "[reaction]" && msg.MediaKind == domain.MediaKindNone
 }
 
 // threadBody renders the visible window of the message log: the viewport is
@@ -2376,11 +2460,17 @@ func (m *Model) clearPathSuggestions() {
 }
 
 func (m *Model) refreshPathSuggestions() {
+	m.suggestionsKind = "Paths"
 	suggestions := filePathSuggestions(m.composer.Value(), maxPathSuggestions)
-	m.suggestionsAreEmoji = false
 	if len(suggestions) == 0 {
-		suggestions = emojiSuggestions(m.composer.Value(), maxPathSuggestions)
-		m.suggestionsAreEmoji = len(suggestions) > 0
+		if suggestions = emojiSuggestions(m.composer.Value(), maxPathSuggestions); len(suggestions) > 0 {
+			m.suggestionsKind = "Emoji"
+		}
+	}
+	if len(suggestions) == 0 {
+		if suggestions = m.mentionSuggestions(maxPathSuggestions); len(suggestions) > 0 {
+			m.suggestionsKind = "Mentions"
+		}
 	}
 	m.pathSuggestions = suggestions
 	if len(m.pathSuggestions) == 0 {
@@ -2395,25 +2485,68 @@ func (m *Model) applySelectedPathSuggestion() bool {
 	if len(m.pathSuggestions) == 0 {
 		return false
 	}
-	m.composer.SetValue(m.pathSuggestions[m.pathSuggestionIdx].replacement)
+	suggestion := m.pathSuggestions[m.pathSuggestionIdx]
+	m.composer.SetValue(suggestion.replacement)
+	if suggestion.mentionJID != "" {
+		if m.draftMentions == nil {
+			m.draftMentions = make(map[string]string)
+		}
+		m.draftMentions[suggestion.mentionName] = suggestion.mentionJID
+	}
 	m.refreshPathSuggestions()
 	return true
+}
+
+// mentionSuggestions offers people to tag while the draft ends in an
+// unfinished "@prefix" token. Candidates come from the loaded thread's
+// senders, newest first, so group members who spoke recently rank higher.
+func (m Model) mentionSuggestions(limit int) []pathSuggestion {
+	draft := m.composer.Value()
+	match := trailingMentionPrefix.FindStringSubmatchIndex(draft)
+	if match == nil {
+		return nil
+	}
+	head := draft[:match[3]]
+	prefix := strings.ToLower(draft[match[4]:match[5]])
+	seen := make(map[string]bool)
+	var suggestions []pathSuggestion
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		msg := m.messages[i]
+		if msg.FromMe || msg.SenderJID == "" {
+			continue
+		}
+		name := collapseWhitespace(msg.SenderName)
+		// Skip masked placeholder names; tagging needs a real name to show.
+		if name == "" || displaySenderLabel(name) != name {
+			continue
+		}
+		if seen[name] || !strings.HasPrefix(strings.ToLower(name), prefix) {
+			continue
+		}
+		seen[name] = true
+		suggestions = append(suggestions, pathSuggestion{
+			label:       "@" + name,
+			replacement: head + "@" + name + " ",
+			mentionName: name,
+			mentionJID:  msg.SenderJID,
+		})
+		if len(suggestions) >= limit {
+			break
+		}
+	}
+	return suggestions
 }
 
 func (m Model) renderPathSuggestions(width int) string {
 	if len(m.pathSuggestions) == 0 {
 		return ""
 	}
-	kind := "Paths"
-	if m.suggestionsAreEmoji {
-		kind = "Emoji"
-	}
 	var heading string
 	switch {
 	case m.pathSuggestionFocus:
-		heading = kind + " · j/k move · enter/tab apply · esc return"
+		heading = m.suggestionsKind + " · j/k move · enter/tab apply · esc return"
 	default:
-		heading = kind + " · tab focus list · keep typing to refine"
+		heading = m.suggestionsKind + " · tab focus list · keep typing to refine"
 	}
 	lines := []string{smallCap(heading, width)}
 	for idx, suggestion := range m.pathSuggestions {
@@ -2428,6 +2561,41 @@ func (m Model) renderPathSuggestions(width int) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// trailingMentionPrefix matches an unfinished "@name" token at the end of
+// the draft — the trigger for mention suggestions. Names may contain spaces
+// ("@Pranjal Ag…"), but never another "@".
+var trailingMentionPrefix = regexp.MustCompile(`(^|\s)@([A-Za-z][\w .-]{0,24})$`)
+
+// applyDraftMentions converts the "@Name" tags picked from the mention list
+// into WhatsApp's "@<number>" wire format and returns the tagged JIDs for
+// the message's context info. Tags the user deleted before sending are
+// simply not present and drop out.
+func applyDraftMentions(text string, mentions map[string]string) (string, []string) {
+	if len(mentions) == 0 {
+		return text, nil
+	}
+	names := make([]string, 0, len(mentions))
+	for name := range mentions {
+		names = append(names, name)
+	}
+	// Longest first so "@Pranjal Agarwal" is not clobbered by "@Pranjal".
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	var jids []string
+	for _, name := range names {
+		tag := "@" + name
+		if !strings.Contains(text, tag) {
+			continue
+		}
+		user := jidUserPart(mentions[name])
+		if user == "" {
+			continue
+		}
+		text = strings.ReplaceAll(text, tag, "@"+user)
+		jids = append(jids, mentions[name])
+	}
+	return text, jids
 }
 
 func appendDraftToken(existing, token string) string {

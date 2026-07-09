@@ -121,7 +121,7 @@ func (a *Adapter) Stop() error {
 	return nil
 }
 
-func (a *Adapter) SendText(ctx context.Context, chatJID, text string) error {
+func (a *Adapter) SendText(ctx context.Context, chatJID, text string, mentionJIDs ...string) error {
 	client := a.clientRef()
 	if client == nil {
 		return errors.New("client is not ready")
@@ -134,9 +134,20 @@ func (a *Adapter) SendText(ctx context.Context, chatJID, text string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.SendMessage(ctx, jid, &waE2E.Message{
-		Conversation: proto.String(text),
-	})
+	message := &waE2E.Message{Conversation: proto.String(text)}
+	if len(mentionJIDs) > 0 {
+		// Groups address members by LID alias: map each mentioned phone JID
+		// (and its "@<user>" token in the text) to the alias so recipients'
+		// clients recognize and highlight the mention.
+		if jid.Server == types.GroupServer {
+			text, mentionJIDs = a.mapMentionsToLID(ctx, text, mentionJIDs)
+		}
+		message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String(text),
+			ContextInfo: &waE2E.ContextInfo{MentionedJID: mentionJIDs},
+		}}
+	}
+	resp, err := client.SendMessage(ctx, jid, message)
 	if err != nil {
 		return fmt.Errorf("send message: %w", err)
 	}
@@ -563,6 +574,13 @@ func (a *Adapter) handleMessage(ctx context.Context, evt *waevents.Message) erro
 	if reaction := evt.Message.GetReactionMessage(); reaction != nil {
 		if evt.Info.IsFromMe {
 			sender = a.selfJID()
+		} else if evt.Info.PushName != "" {
+			// Keep learning names from reaction events too, so reactors who
+			// never sent a message still render with a name.
+			_ = a.repo.UpsertContact(ctx, domain.Contact{
+				JID:      sender.String(),
+				PushName: evt.Info.PushName,
+			})
 		}
 		return a.recordReaction(ctx, chatJID, sender, reaction, evt.Info.Timestamp)
 	}
@@ -646,6 +664,15 @@ func (a *Adapter) SendReaction(ctx context.Context, chatJID, targetSenderJID, ta
 	targetSender, err := types.ParseJID(targetSenderJID)
 	if err != nil {
 		return fmt.Errorf("parse target sender JID: %w", err)
+	}
+	if chat.Server == types.GroupServer {
+		// Group messages are LID-addressed: the original message key carries
+		// the sender's LID alias, while the store canonicalizes senders to
+		// phone JIDs. Map back so the reaction key matches the message other
+		// participants know.
+		if lid, ok := a.lidForPhoneJID(ctx, targetSender); ok {
+			targetSender = lid
+		}
 	}
 	if _, err := client.SendMessage(ctx, chat, client.BuildReaction(chat, targetSender, targetMessageID, emoji)); err != nil {
 		return fmt.Errorf("send reaction: %w", err)
@@ -1232,6 +1259,47 @@ func (a *Adapter) normalizeDirectChats(ctx context.Context) error {
 		return fmt.Errorf("iterate lid mappings for chat normalization: %w", err)
 	}
 	return nil
+}
+
+// mapMentionsToLID rewrites mention JIDs and their "@<user>" text tokens to
+// the sender's LID alias where one exists.
+func (a *Adapter) mapMentionsToLID(ctx context.Context, text string, mentionJIDs []string) (string, []string) {
+	mapped := make([]string, 0, len(mentionJIDs))
+	for _, raw := range mentionJIDs {
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			mapped = append(mapped, raw)
+			continue
+		}
+		lid, ok := a.lidForPhoneJID(ctx, jid)
+		if !ok {
+			mapped = append(mapped, raw)
+			continue
+		}
+		text = strings.ReplaceAll(text, "@"+jid.User, "@"+lid.User)
+		mapped = append(mapped, lid.String())
+	}
+	return text, mapped
+}
+
+// lidForPhoneJID reverse-maps a phone-number JID to its hidden-LID alias
+// via the session's lid map. The bool reports whether a mapping exists.
+func (a *Adapter) lidForPhoneJID(ctx context.Context, jid types.JID) (types.JID, bool) {
+	if jid.Server != types.DefaultUserServer {
+		return jid, false
+	}
+	a.mu.RLock()
+	db := a.sessionDB
+	a.mu.RUnlock()
+	if db == nil {
+		return jid, false
+	}
+	var lidUser string
+	err := db.QueryRowContext(ctx, `SELECT lid FROM whatsmeow_lid_map WHERE pn = ?`, jid.User).Scan(&lidUser)
+	if err != nil || strings.TrimSpace(lidUser) == "" {
+		return jid, false
+	}
+	return types.NewJID(lidUser, types.HiddenUserServer), true
 }
 
 // canonicalUserJID maps a hidden-LID user JID (…@lid) to its phone-number

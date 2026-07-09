@@ -730,3 +730,201 @@ func TestEmojiSuggestionsForTrailingShortcode(t *testing.T) {
 		t.Fatal("expected no suggestions without a trailing :prefix")
 	}
 }
+
+func TestLegacyReactionRowsAreHiddenNotDeleted(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = []domain.Message{
+		{ID: "m1", ChatJID: m.currentChatID, SenderJID: "a@s.whatsapp.net", Text: "hello",
+			Timestamp: time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived},
+		{ID: "legacy", ChatJID: m.currentChatID, SenderJID: "a@s.whatsapp.net", Text: "[reaction]",
+			Timestamp: time.Date(2026, 7, 8, 10, 1, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived},
+	}
+	m.threadMessageLimit = messageLimit
+
+	body := plain(strings.Join(m.threadMessageLines(80), "\n"))
+	if strings.Contains(body, "[reaction]") {
+		t.Fatalf("legacy [reaction] placeholder row should be hidden:\n%s", body)
+	}
+	if !strings.Contains(body, "hello") {
+		t.Fatalf("real messages must still render:\n%s", body)
+	}
+}
+
+func TestMediaCaptionStartingWithBracketIsShown(t *testing.T) {
+	t.Parallel()
+
+	msg := domain.Message{
+		ID: "m1", ChatJID: "a@s.whatsapp.net", SenderJID: "a@s.whatsapp.net",
+		Text: "[URGENT] prod is down, call me", MediaKind: domain.MediaKindImage,
+		Timestamp: time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived,
+	}
+	out := plain(renderThreadMessage(msg, 60, nil, false))
+	if !strings.Contains(out, "[URGENT] prod is down") {
+		t.Fatalf("caption starting with '[' must render:\n%s", out)
+	}
+
+	// Exact placeholders (with or without filename) still collapse to the chip.
+	msg.Text = "[image]"
+	out = plain(renderThreadMessage(msg, 60, nil, false))
+	if strings.Contains(out, "[image]") {
+		t.Fatalf("bare placeholder should be replaced by the chip:\n%s", out)
+	}
+}
+
+func TestReactCursorReanchorsAfterReload(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 10)
+	m.threadMessageLimit = messageLimit
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	targetID := model.messages[model.reactIndex].ID
+
+	// Reload arrives with the two oldest messages dropped and two new ones
+	// appended (capped-window shape): indexes shift by two.
+	reloaded := makeThreadMessages(m.currentChatID, 12)[2:]
+	updated, _ = model.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: reloaded, limit: messageLimit})
+	model = updated.(Model)
+	if !model.reacting {
+		t.Fatal("react mode should survive a reload that keeps the target")
+	}
+	if got := model.messages[model.reactIndex].ID; got != targetID {
+		t.Fatalf("react cursor now points at %q, want re-anchored to %q", got, targetID)
+	}
+
+	// A reload that drops the target exits react mode instead of guessing.
+	updated, _ = model.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: makeThreadMessages(m.currentChatID, 3), limit: messageLimit})
+	model = updated.(Model)
+	if model.reacting {
+		t.Fatal("react mode must exit when the target message disappears")
+	}
+}
+
+func TestNewMessageCountingSurvivesCappedReload(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = makeThreadMessages(m.currentChatID, 40)
+	m.threadMessageLimit = messageLimit
+	m.threadScroll = 20
+
+	// Capped reload: same slice length (40), two dropped from the top and
+	// two new appended at the bottom.
+	reloaded := makeThreadMessages(m.currentChatID, 42)[2:]
+	updated, _ := m.Update(messagesLoadedMsg{chatJID: m.currentChatID, messages: reloaded, limit: messageLimit})
+	model := updated.(Model)
+	if model.threadNewWhileAway != 2 {
+		t.Fatalf("threadNewWhileAway = %d, want 2 despite unchanged slice length", model.threadNewWhileAway)
+	}
+}
+
+func TestMentionSuggestionsFromThreadSenders(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.messages = []domain.Message{
+		{ID: "m1", ChatJID: m.currentChatID, SenderJID: "911234@s.whatsapp.net", SenderName: "Pranjal Agarwal",
+			Text: "hi", Timestamp: time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived, IsGroup: true},
+		{ID: "m2", ChatJID: m.currentChatID, SenderJID: "922222@s.whatsapp.net", SenderName: "Shashwat Jha",
+			Text: "yo", Timestamp: time.Date(2026, 7, 8, 10, 1, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived, IsGroup: true},
+	}
+	m.composing = true
+	m.composer.Focus()
+	m.composer.SetValue("listen @pra")
+	m.refreshPathSuggestions()
+
+	if m.suggestionsKind != "Mentions" || len(m.pathSuggestions) != 1 {
+		t.Fatalf("suggestions = %#v (%s), want one mention for @pra", m.pathSuggestions, m.suggestionsKind)
+	}
+	if m.pathSuggestions[0].label != "@Pranjal Agarwal" {
+		t.Fatalf("label = %q, want @Pranjal Agarwal", m.pathSuggestions[0].label)
+	}
+
+	if !m.applySelectedPathSuggestion() {
+		t.Fatal("expected suggestion to apply")
+	}
+	if got := m.composer.Value(); got != "listen @Pranjal Agarwal " {
+		t.Fatalf("composer = %q, want tag inserted", got)
+	}
+	if m.draftMentions["Pranjal Agarwal"] != "911234@s.whatsapp.net" {
+		t.Fatalf("draftMentions = %#v, want tagged JID recorded", m.draftMentions)
+	}
+}
+
+func TestSendingTaggedMessageConvertsToWireFormat(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	transport := &fakeTransport{events: make(chan domain.Event, 1)}
+	m := NewModel(repo, transport)
+	m.width = 96
+	m.height = 28
+	m.ready = true
+	m.mode = viewThread
+	m.currentChatID = "project-alpha@g.us"
+	m.composing = true
+	m.composer.Focus()
+	m.composer.SetValue("@Pranjal Agarwal cab aa gayi")
+	m.draftMentions = map[string]string{"Pranjal Agarwal": "911234@s.whatsapp.net"}
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected send command")
+	}
+	if result := cmd(); result == nil {
+		t.Fatal("expected send result")
+	}
+	if transport.sentText != "@911234 cab aa gayi" {
+		t.Fatalf("sentText = %q, want wire-format mention", transport.sentText)
+	}
+	if len(transport.sentMentions) != 1 || transport.sentMentions[0] != "911234@s.whatsapp.net" {
+		t.Fatalf("sentMentions = %#v, want tagged JID in context info", transport.sentMentions)
+	}
+}
+
+func TestApplyDraftMentionsLongestNameFirst(t *testing.T) {
+	t.Parallel()
+
+	mentions := map[string]string{
+		"Pranjal":         "911111@s.whatsapp.net",
+		"Pranjal Agarwal": "922222@s.whatsapp.net",
+	}
+	text, jids := applyDraftMentions("@Pranjal Agarwal and @Pranjal", mentions)
+	if text != "@922222 and @911111" {
+		t.Fatalf("text = %q, want longest tag converted first", text)
+	}
+	if len(jids) != 2 {
+		t.Fatalf("jids = %#v, want both", jids)
+	}
+}

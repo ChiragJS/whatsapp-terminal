@@ -1054,15 +1054,6 @@ func newTestStore(t *testing.T) *Store {
 	return repo
 }
 
-func mustOpenStore(t *testing.T, dir string) *Store {
-	t.Helper()
-	repo, err := New(filepath.Join(dir, "app.db"))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	return repo
-}
-
 func TestUpsertReactionTombstoneRejectsStaleUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -1135,33 +1126,5 @@ func TestListMessagesAttachesReactionsWithNames(t *testing.T) {
 	reaction := messages[0].Reactions[0]
 	if reaction.Emoji != "😂" || reaction.SenderName != "Shashwat" {
 		t.Fatalf("reaction = %#v, want 😂 by Shashwat", reaction)
-	}
-}
-
-func TestInitPurgesReactionPlaceholderRows(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	store := mustOpenStore(t, dir)
-	ctx := context.Background()
-	if err := store.RecordMessage(ctx, domain.Message{
-		ID: "junk-1", ChatJID: "g@g.us", SenderJID: "a@s.whatsapp.net", Text: "[reaction]",
-		Timestamp: time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), Receipt: domain.ReceiptStateReceived, IsGroup: true,
-	}, false); err != nil {
-		t.Fatalf("RecordMessage() error = %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-
-	// Reopening runs init migrations, which purge the placeholder rows.
-	store = mustOpenStore(t, dir)
-	t.Cleanup(func() { _ = store.Close() })
-	messages, err := store.ListMessages(ctx, "g@g.us", 10)
-	if err != nil {
-		t.Fatalf("ListMessages() error = %v", err)
-	}
-	if len(messages) != 0 {
-		t.Fatalf("messages = %#v, want [reaction] placeholder purged", messages)
 	}
 }

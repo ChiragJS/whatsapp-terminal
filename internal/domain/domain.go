@@ -113,7 +113,9 @@ type Transport interface {
 	Stop() error
 	Events() <-chan Event
 
-	SendText(context.Context, string, string) error
+	// SendText sends a text message; mentionJIDs lists the users tagged
+	// with "@" tokens in the text (WhatsApp context-info mentions).
+	SendText(ctx context.Context, chatJID, text string, mentionJIDs ...string) error
 	SendImage(context.Context, string, string, string) error
 	SendMedia(context.Context, string, string, string) error
 	SendVoiceNote(context.Context, string, string, time.Duration) error

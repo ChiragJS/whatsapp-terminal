@@ -52,8 +52,9 @@ func (p *systemAudioPlayer) Play(path string) error {
 	defer p.mu.Unlock()
 
 	if p.cmd != nil && p.cmd.Process != nil {
+		// Kill only: the reaper goroutine started with this cmd owns Wait,
+		// and exec.Cmd.Wait is not safe to call concurrently.
 		_ = p.cmd.Process.Kill()
-		_ = p.cmd.Wait()
 		p.cmd = nil
 	}
 	cmd, err := playerCommand(path)

@@ -184,23 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts DESC);
 			return err
 		}
 	}
-	if err := s.purgeReactionPlaceholderMessages(ctx); err != nil {
-		return err
-	}
 	return s.clearJIDTitles(ctx)
-}
-
-// purgeReactionPlaceholderMessages deletes message rows an older version
-// created for incoming reactions ("[reaction]" with no emoji or target).
-// Reactions now live in the reactions table; a history re-sync repopulates
-// them there. Idempotent.
-func (s *Store) purgeReactionPlaceholderMessages(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `
-DELETE FROM messages WHERE text_body = '[reaction]' AND media_kind = ''
-`); err != nil {
-		return fmt.Errorf("purge reaction placeholder messages: %w", err)
-	}
-	return nil
 }
 
 // UpsertReaction applies one reaction state change with last-write-wins

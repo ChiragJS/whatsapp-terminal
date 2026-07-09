@@ -60,7 +60,7 @@ func (t *Transport) Events() <-chan domain.Event {
 	return t.events
 }
 
-func (t *Transport) SendText(ctx context.Context, chatJID, text string) error {
+func (t *Transport) SendText(ctx context.Context, chatJID, text string, _ ...string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
