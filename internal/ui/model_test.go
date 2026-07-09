@@ -2639,3 +2639,62 @@ func TestMediaPickerWithoutMediaSetsError(t *testing.T) {
 		t.Fatal("expected lastErr when there is no media to browse")
 	}
 }
+
+func TestErrorBannerAutoDismissesAfterTTL(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.lastErr = "message cannot be empty"
+
+	// Simulate the passage of time without needing to sleep: the tick
+	// handler compares against the wall clock, so backdating lastErrSince
+	// exercises the same branch a real 10s wait would.
+	updated, cmd := m.Update(errorExpiryTickMsg{})
+	model := updated.(Model)
+	if model.lastErr != "message cannot be empty" {
+		t.Fatalf("lastErr = %q, want the error to persist before the TTL elapses", model.lastErr)
+	}
+	if cmd == nil {
+		t.Fatal("expected the tick to reschedule itself")
+	}
+
+	model.lastErrSince = time.Now().Add(-errorBannerTTL - time.Second)
+	updated, _ = model.Update(errorExpiryTickMsg{})
+	model = updated.(Model)
+	if model.lastErr != "" {
+		t.Fatalf("lastErr = %q, want cleared after the TTL elapsed", model.lastErr)
+	}
+}
+
+func TestErrorBannerRestartsTTLOnNewError(t *testing.T) {
+	t.Parallel()
+
+	repo := seededRepo(t)
+	m := NewModel(repo, &fakeTransport{events: make(chan domain.Event, 1)})
+	m.width = 96
+	m.height = 26
+	m.ready = true
+	m.lastErr = "first error"
+
+	updated, _ := m.Update(errorExpiryTickMsg{})
+	model := updated.(Model)
+	model.lastErrSince = time.Now().Add(-errorBannerTTL + time.Millisecond) // about to expire
+
+	model.lastErr = "second error"
+	updated, _ = model.Update(errorExpiryTickMsg{})
+	model = updated.(Model)
+	if model.lastErr != "second error" {
+		t.Fatalf("lastErr = %q, want the newer error to survive and restart its own TTL", model.lastErr)
+	}
+
+	// The old near-expiry deadline must not carry over to the new message.
+	updated, _ = model.Update(errorExpiryTickMsg{})
+	model = updated.(Model)
+	if model.lastErr != "second error" {
+		t.Fatalf("lastErr = %q, want the new error's TTL to have restarted", model.lastErr)
+	}
+}

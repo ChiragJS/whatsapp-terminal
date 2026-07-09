@@ -64,6 +64,17 @@ func keymapReloadTickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return keymapReloadTickMsg{} })
 }
 
+// errorExpiryTickMsg drives the footer error banner's auto-dismiss.
+type errorExpiryTickMsg struct{}
+
+// errorBannerTTL is how long a footer error stays visible before clearing
+// itself, so a stale "message cannot be empty" doesn't sit there forever.
+const errorBannerTTL = 10 * time.Second
+
+func errorExpiryTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return errorExpiryTickMsg{} })
+}
+
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // quickReactions is the 1-6 palette in react mode, mirroring WhatsApp's
@@ -152,11 +163,15 @@ type Model struct {
 	forceRepaint bool
 	frameNonce   int
 
-	mode           viewMode
-	width          int
-	height         int
-	status         string
-	lastErr        string
+	mode    viewMode
+	width   int
+	height  int
+	status  string
+	lastErr string
+	// lastErrSeen/lastErrSince back the footer error banner's auto-dismiss;
+	// see handleErrorExpiryTick.
+	lastErrSeen    string
+	lastErrSince   time.Time
 	qrCode         string
 	ready          bool
 	syncingRecent  bool
@@ -376,11 +391,32 @@ func (m Model) WithTheme(slug string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{tea.ClearScreen, waitForTransportEvent(m.events), m.loadChats("")}
+	cmds := []tea.Cmd{tea.ClearScreen, waitForTransportEvent(m.events), m.loadChats(""), errorExpiryTickCmd()}
 	if m.dataDir != "" {
 		cmds = append(cmds, keymapReloadTickCmd())
 	}
 	return tea.Batch(cmds...)
+}
+
+// handleErrorExpiryTick auto-dismisses the footer error banner errorBannerTTL
+// after it last changed. It tracks the error text itself rather than being
+// told when errors are set, so none of the ~20 call sites that set m.lastErr
+// need to know about the timer: a changed message restarts the countdown, an
+// unchanged one expires, and a message already cleared elsewhere is a no-op.
+func (m Model) handleErrorExpiryTick() (tea.Model, tea.Cmd) {
+	switch {
+	case m.lastErr == "":
+		m.lastErrSeen = ""
+		m.lastErrSince = time.Time{}
+	case m.lastErr != m.lastErrSeen:
+		m.lastErrSeen = m.lastErr
+		m.lastErrSince = time.Now()
+	case time.Since(m.lastErrSince) >= errorBannerTTL:
+		m.lastErr = ""
+		m.lastErrSeen = ""
+		m.lastErrSince = time.Time{}
+	}
+	return m, errorExpiryTickCmd()
 }
 
 func (m Model) WithQuitAfterNavigation(enabled bool) Model {
@@ -590,6 +626,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.spinnerFrame++
 		return m, spinnerTickCmd()
+	case errorExpiryTickMsg:
+		return m.handleErrorExpiryTick()
 	case keymapReloadTickMsg:
 		return m.handleKeymapReloadTick()
 	case attachmentStagedMsg:
